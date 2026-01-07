@@ -9,9 +9,21 @@ from typing import Optional
 from unittest.mock import patch
 
 from comfy.ldm.flux.layers import timestep_embedding, apply_mod
-from comfy.ldm.lightricks.model import precompute_freqs_cis
 from comfy.ldm.lightricks.symmetric_patchifier import latent_to_pixel_coords
 from comfy.ldm.wan.model import sinusoidal_embedding_1d
+
+# Import helper functions from lightricks model
+try:
+    from comfy.ldm.lightricks.model import (
+        generate_freqs, 
+        interleaved_freqs_cis, 
+        split_freqs_cis,
+        get_fractional_positions,
+        generate_freq_grid_pytorch
+    )
+except ImportError:
+    # Fallback for older ComfyUI versions
+    from comfy.ldm.lightricks.model import precompute_freqs_cis as _imported_precompute_freqs_cis
 
 
 SUPPORTED_MODELS_COEFFICIENTS = {
@@ -32,6 +44,47 @@ SUPPORTED_MODELS_COEFFICIENTS = {
     "wan2.1_i2v_480p_14B_ret_mode": [2.57151496e+05, -3.54229917e+04, 1.40286849e+03, -1.35890334e+01, 1.32517977e-01],
     "wan2.1_i2v_720p_14B_ret_mode": [8.10705460e+03, 2.13393892e+03, -3.72934672e+02, 1.66203073e+01, -4.17769401e-02],
 }
+
+def precompute_freqs_cis(
+    indices_grid,
+    dim,
+    out_dtype,
+    theta=10000.0,
+    max_pos=[20, 2048, 2048],
+    use_middle_indices_grid=False,
+    num_attention_heads=32,
+):
+    """
+    Standalone version of precompute_freqs_cis for compatibility with newer ComfyUI versions.
+    This function was previously in comfy.ldm.lightricks.model but is now a class method.
+    """
+    try:
+        # Try to use the new helper functions if available
+        split_mode = False  # Default to interleaved mode
+        
+        # Generate frequency grid
+        indices = generate_freq_grid_pytorch(theta, len(max_pos), dim, indices_grid.device)
+        
+        # Generate frequencies
+        freqs = generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
+        
+        if split_mode:
+            expected_freqs = dim // 2
+            current_freqs = freqs.shape[-1]
+            pad_size = expected_freqs - current_freqs
+            cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads)
+        else:
+            # 2 because of cos and sin by 3 for (t, x, y), 1 for temporal only
+            n_elem = 2 * indices_grid.shape[1]
+            cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem)
+        
+        return cos_freq.to(out_dtype), sin_freq.to(out_dtype), split_mode
+    except Exception as e:
+        # If new functions aren't available, try the old import
+        try:
+            return _imported_precompute_freqs_cis(indices_grid, dim, out_dtype, theta, max_pos, use_middle_indices_grid, num_attention_heads)
+        except:
+            raise ImportError(f"Failed to import or execute precompute_freqs_cis: {str(e)}")
 
 def poly1d(coefficients, x):
     result = torch.zeros_like(x)
