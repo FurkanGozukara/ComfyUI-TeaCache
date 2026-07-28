@@ -1,4 +1,6 @@
 import math
+import importlib
+import inspect
 import torch
 import comfy.ldm.common_dit
 import comfy.model_management as mm
@@ -12,18 +14,57 @@ from comfy.ldm.flux.layers import timestep_embedding, apply_mod
 from comfy.ldm.lightricks.symmetric_patchifier import latent_to_pixel_coords
 from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
-# Import helper functions from lightricks model
-try:
-    from comfy.ldm.lightricks.model import (
-        generate_freqs, 
-        interleaved_freqs_cis, 
-        split_freqs_cis,
-        get_fractional_positions,
-        generate_freq_grid_pytorch
-    )
-except ImportError:
-    # Fallback for older ComfyUI versions
-    from comfy.ldm.lightricks.model import precompute_freqs_cis as _imported_precompute_freqs_cis
+
+def _optional_import(module_name, attr):
+    """Import a single symbol, returning None when this ComfyUI version doesn't have it.
+
+    ComfyUI keeps reshuffling the lightricks rope helpers, so importing them as a group
+    means one upstream rename takes the whole node down with an ImportError.
+    """
+    try:
+        return getattr(importlib.import_module(module_name), attr, None)
+    except ImportError:
+        return None
+
+
+# Rope helpers from the lightricks model. Every one of these is optional: which ones
+# exist depends on the ComfyUI version, and precompute_freqs_cis() below picks whatever
+# combination it finds.
+_LIGHTRICKS = "comfy.ldm.lightricks.model"
+generate_freqs = _optional_import(_LIGHTRICKS, "generate_freqs")
+interleaved_freqs_cis = _optional_import(_LIGHTRICKS, "interleaved_freqs_cis")
+split_freqs_cis = _optional_import(_LIGHTRICKS, "split_freqs_cis")
+get_fractional_positions = _optional_import(_LIGHTRICKS, "get_fractional_positions")
+generate_freq_grid_pytorch = _optional_import(_LIGHTRICKS, "generate_freq_grid_pytorch")
+freqs_cis_matrix = _optional_import(_LIGHTRICKS, "freqs_cis_matrix")
+_imported_precompute_freqs_cis = _optional_import(_LIGHTRICKS, "precompute_freqs_cis")
+
+# Used by flux when a reference latent makes part of the sequence timestep-zero.
+invert_slices = _optional_import("comfy.ldm.flux.model", "invert_slices")
+
+_KWARG_SUPPORT = {}
+
+
+def _supported_kwargs(fn, **candidate):
+    """Drop keyword arguments that this ComfyUI version's `fn` does not accept.
+
+    The patched forwards mirror current ComfyUI, but blocks gained kwargs over time
+    (transformer_options, timestep_zero_index, ...). Filtering here means one node works
+    across versions instead of raising TypeError on whichever one it wasn't written for.
+    """
+    key = (fn, tuple(sorted(candidate)))
+    allowed = _KWARG_SUPPORT.get(key)
+    if allowed is None:
+        try:
+            params = inspect.signature(fn).parameters
+            if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                allowed = set(candidate)
+            else:
+                allowed = {k for k in candidate if k in params}
+        except (TypeError, ValueError):
+            allowed = set(candidate)
+        _KWARG_SUPPORT[key] = allowed
+    return {k: v for k, v in candidate.items() if k in allowed}
 
 
 SUPPORTED_MODELS_COEFFICIENTS = {
@@ -55,36 +96,41 @@ def precompute_freqs_cis(
     num_attention_heads=32,
 ):
     """
-    Standalone version of precompute_freqs_cis for compatibility with newer ComfyUI versions.
-    This function was previously in comfy.ldm.lightricks.model but is now a class method.
+    Standalone version of precompute_freqs_cis for ComfyUI versions where it is neither a
+    module-level function nor a model method.
+
+    Only teacache_ltxvmodel_forward (the legacy whole-forward patch) uses this; ComfyUI
+    versions that expose LTXBaseModel._precompute_freqs_cis go through the model's own
+    implementation instead, so this never has to chase the newest rope layout.
     """
-    try:
-        # Try to use the new helper functions if available
-        split_mode = False  # Default to interleaved mode
-        
-        # Generate frequency grid
-        indices = generate_freq_grid_pytorch(theta, len(max_pos), dim, indices_grid.device)
-        
-        # Generate frequencies
+    if generate_freqs is not None and generate_freq_grid_pytorch is not None:
+        indices = generate_freq_grid_pytorch(theta, indices_grid.shape[1], dim, indices_grid.device)
         freqs = generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
-        
-        if split_mode:
-            expected_freqs = dim // 2
-            current_freqs = freqs.shape[-1]
-            pad_size = expected_freqs - current_freqs
-            cos_freq, sin_freq = split_freqs_cis(freqs, pad_size, num_attention_heads)
-        else:
-            # 2 because of cos and sin by 3 for (t, x, y), 1 for temporal only
-            n_elem = 2 * indices_grid.shape[1]
-            cos_freq, sin_freq = interleaved_freqs_cis(freqs, dim % n_elem)
-        
-        return cos_freq.to(out_dtype), sin_freq.to(out_dtype), split_mode
-    except Exception as e:
-        # If new functions aren't available, try the old import
-        try:
-            return _imported_precompute_freqs_cis(indices_grid, dim, out_dtype, theta, max_pos, use_middle_indices_grid, num_attention_heads)
-        except:
-            raise ImportError(f"Failed to import or execute precompute_freqs_cis: {str(e)}")
+        # 2 because of cos and sin by 3 for (t, x, y), 1 for temporal only
+        n_elem = 2 * indices_grid.shape[1]
+        pad_size = dim % n_elem
+
+        if freqs_cis_matrix is not None:
+            # Newer layout: a single (rotation_matrix, split_mode) pair.
+            return freqs_cis_matrix(freqs, pad_size, False, num_attention_heads, out_dtype)
+        if interleaved_freqs_cis is not None:
+            cos_freq, sin_freq = interleaved_freqs_cis(freqs, pad_size)
+            return cos_freq.to(out_dtype), sin_freq.to(out_dtype), False
+
+    if _imported_precompute_freqs_cis is not None:
+        return _imported_precompute_freqs_cis(indices_grid, dim, out_dtype, theta, max_pos, use_middle_indices_grid, num_attention_heads)
+
+    raise RuntimeError(
+        "TeaCache could not build LTXV rope embeddings: this ComfyUI version exposes none of "
+        "the known lightricks rope helpers."
+    )
+
+
+def _snapshot(tensor, device):
+    """Copy of `tensor` on `device` that later in-place block writes cannot alias."""
+    if tensor.device == device:
+        return tensor.detach().clone()
+    return tensor.detach().to(device)
 
 def poly1d(coefficients, x):
     result = torch.zeros_like(x)
@@ -102,18 +148,19 @@ def teacache_flux_forward(
         y: Tensor,
         guidance: Tensor = None,
         control = None,
+        timestep_zero_index=None,
         transformer_options={},
         attn_mask: Tensor = None,
+        **kwargs,
     ) -> Tensor:
+        transformer_options = transformer_options.copy()
+        patches = transformer_options.get("patches", {})
         patches_replace = transformer_options.get("patches_replace", {})
         rel_l1_thresh = transformer_options.get("rel_l1_thresh")
         coefficients = transformer_options.get("coefficients")
         enable_teacache = transformer_options.get("enable_teacache", True)
         cache_device = transformer_options.get("cache_device")
 
-        if y is None:
-            y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
-            
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
 
@@ -124,8 +171,22 @@ def teacache_flux_forward(
             if guidance is not None:
                 vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-        vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
+        if getattr(self, "vector_in", None) is not None:
+            if y is None:
+                y = torch.zeros((img.shape[0], self.params.vec_in_dim), device=img.device, dtype=img.dtype)
+            vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+
+        if getattr(self, "txt_norm", None) is not None:
+            txt = self.txt_norm(txt)
         txt = self.txt_in(txt)
+
+        if "post_input" in patches:
+            for p in patches["post_input"]:
+                out = p({"img": img, "txt": txt, "img_ids": img_ids, "txt_ids": txt_ids, "transformer_options": transformer_options})
+                img = out["img"]
+                txt = out["txt"]
+                img_ids = out["img_ids"]
+                txt_ids = out["txt_ids"]
 
         if img_ids is not None:
             ids = torch.cat((txt_ids, img_ids), dim=1)
@@ -133,12 +194,39 @@ def teacache_flux_forward(
         else:
             pe = None
 
+        vec_orig = vec
+        txt_vec = vec
+        extra_kwargs = {}
+        modulation_dims = None
+        if timestep_zero_index is not None:
+            if invert_slices is None:
+                raise RuntimeError("TeaCache: comfy.ldm.flux.model.invert_slices is missing; cannot handle reference latents.")
+            modulation_dims = []
+            batch = vec.shape[0] // 2
+            vec_orig = vec_orig.reshape(2, batch, vec.shape[1]).movedim(0, 1)
+            invert = invert_slices(timestep_zero_index, img.shape[1])
+            for s in invert:
+                modulation_dims.append((s[0], s[1], 0))
+            for s in timestep_zero_index:
+                modulation_dims.append((s[0], s[1], 1))
+            extra_kwargs["modulation_dims_img"] = modulation_dims
+            txt_vec = vec[:batch]
+
+        global_modulation = getattr(self.params, "global_modulation", False)
+        if global_modulation:
+            vec = (self.double_stream_modulation_img(vec_orig), self.double_stream_modulation_txt(txt_vec))
+
         blocks_replace = patches_replace.get("dit", {})
 
         # enable teacache
-        img_mod1, _ = self.double_blocks[0].img_mod(vec)
-        modulated_inp = self.double_blocks[0].img_norm1(img)
-        modulated_inp = apply_mod(modulated_inp, (1 + img_mod1.scale), img_mod1.shift).to(cache_device)
+        first_block = self.double_blocks[0]
+        if getattr(first_block, "modulation", True):
+            img_mod1, _ = first_block.img_mod(vec)
+        else:
+            # global-modulation checkpoints hand the blocks pre-computed modulation tuples
+            (img_mod1, _), _ = vec
+        modulated_inp = first_block.img_norm1(img)
+        modulated_inp = apply_mod(modulated_inp, (1 + img_mod1.scale), img_mod1.shift, modulation_dims).to(cache_device)
         ca_idx = 0
 
         if not hasattr(self, 'accumulated_rel_l1_distance'):
@@ -158,29 +246,38 @@ def teacache_flux_forward(
 
         self.previous_modulated_input = modulated_inp
 
-        if not enable_teacache:
+        if not enable_teacache or getattr(self, "previous_residual", None) is None:
             should_calc = True
 
         if not should_calc:
-            img += self.previous_residual.to(img.device)
+            img += self.previous_residual.to(device=img.device, dtype=img.dtype)
         else:
-            ori_img = img.to(cache_device)
+            ori_img = _snapshot(img, cache_device)
+            transformer_options["total_blocks"] = len(self.double_blocks)
+            transformer_options["block_type"] = "double"
             for i, block in enumerate(self.double_blocks):
+                transformer_options["block_index"] = i
+                block_kwargs = _supported_kwargs(type(block).forward, transformer_options=transformer_options)
+                block_kwargs.update(extra_kwargs)
                 if ("double_block", i) in blocks_replace:
                     def block_wrap(args):
                         out = {}
+                        wrap_kwargs = _supported_kwargs(type(block).forward, transformer_options=args.get("transformer_options"))
+                        wrap_kwargs.update(extra_kwargs)
                         out["img"], out["txt"] = block(img=args["img"],
                                                     txt=args["txt"],
                                                     vec=args["vec"],
                                                     pe=args["pe"],
-                                                    attn_mask=args.get("attn_mask"))
+                                                    attn_mask=args.get("attn_mask"),
+                                                    **wrap_kwargs)
                         return out
 
                     out = blocks_replace[("double_block", i)]({"img": img,
                                                             "txt": txt,
                                                             "vec": vec,
                                                             "pe": pe,
-                                                            "attn_mask": attn_mask},
+                                                            "attn_mask": attn_mask,
+                                                            "transformer_options": transformer_options},
                                                             {"original_block": block_wrap})
                     txt = out["txt"]
                     img = out["img"]
@@ -189,14 +286,15 @@ def teacache_flux_forward(
                                     txt=txt,
                                     vec=vec,
                                     pe=pe,
-                                    attn_mask=attn_mask)
+                                    attn_mask=attn_mask,
+                                    **block_kwargs)
 
                 if control is not None: # Controlnet
                     control_i = control.get("input")
                     if i < len(control_i):
                         add = control_i[i]
                         if add is not None:
-                            img += add
+                            img[:, :add.shape[1]] += add
 
                 # PuLID attention
                 if getattr(self, "pulid_data", {}):
@@ -213,31 +311,49 @@ def teacache_flux_forward(
 
             img = torch.cat((txt, img), 1)
 
+            if global_modulation:
+                vec, _ = self.single_stream_modulation(vec_orig)
+
+            extra_kwargs = {}
+            if timestep_zero_index is not None:
+                modulation_dims_combined = list(map(lambda x: (0 if x[0] == 0 else x[0] + txt.shape[1], x[1] + txt.shape[1], x[2]), modulation_dims))
+                extra_kwargs["modulation_dims"] = modulation_dims_combined
+
+            transformer_options["total_blocks"] = len(self.single_blocks)
+            transformer_options["block_type"] = "single"
+            transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
             for i, block in enumerate(self.single_blocks):
+                transformer_options["block_index"] = i
+                block_kwargs = _supported_kwargs(type(block).forward, transformer_options=transformer_options)
+                block_kwargs.update(extra_kwargs)
                 if ("single_block", i) in blocks_replace:
                     def block_wrap(args):
                         out = {}
+                        wrap_kwargs = _supported_kwargs(type(block).forward, transformer_options=args.get("transformer_options"))
+                        wrap_kwargs.update(extra_kwargs)
                         out["img"] = block(args["img"],
                                         vec=args["vec"],
                                         pe=args["pe"],
-                                        attn_mask=args.get("attn_mask"))
+                                        attn_mask=args.get("attn_mask"),
+                                        **wrap_kwargs)
                         return out
 
                     out = blocks_replace[("single_block", i)]({"img": img,
                                                             "vec": vec,
                                                             "pe": pe,
-                                                            "attn_mask": attn_mask}, 
+                                                            "attn_mask": attn_mask,
+                                                            "transformer_options": transformer_options},
                                                             {"original_block": block_wrap})
                     img = out["img"]
                 else:
-                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask)
+                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, **block_kwargs)
 
                 if control is not None: # Controlnet
                     control_o = control.get("output")
                     if i < len(control_o):
                         add = control_o[i]
                         if add is not None:
-                            img[:, txt.shape[1] :, ...] += add
+                            img[:, txt.shape[1] : txt.shape[1] + add.shape[1], ...] += add
 
                 # PuLID attention
                 if getattr(self, "pulid_data", {}):
@@ -254,8 +370,12 @@ def teacache_flux_forward(
             img = img[:, txt.shape[1] :, ...]
             self.previous_residual = img.to(cache_device) - ori_img
 
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
-        
+        final_kwargs = {}
+        if timestep_zero_index is not None:
+            final_kwargs["modulation_dims"] = modulation_dims
+
+        img = self.final_layer(img, vec_orig, **final_kwargs)  # (N, T, patch_size ** 2 * out_channels)
+
         return img
 
 def teacache_hidream_forward(
@@ -268,6 +388,7 @@ def teacache_hidream_forward(
         image_cond=None,
         control = None,
         transformer_options = {},
+        **kwargs,
     ) -> torch.Tensor:
         rel_l1_thresh = transformer_options.get("rel_l1_thresh")
         coefficients = transformer_options.get("coefficients")
@@ -363,12 +484,16 @@ def teacache_hidream_forward(
         else:
             should_calc = True
 
+        for k in cond_or_uncond:
+            if self.teacache_state[k]['previous_residual'] is None:
+                should_calc = True
+
         if not should_calc:
             for i, k in enumerate(cond_or_uncond):
-                hidden_states[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(hidden_states.device)
+                hidden_states[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(device=hidden_states.device, dtype=hidden_states.dtype)
         else:
             # 2. Blocks
-            ori_hidden_states = hidden_states.to(cache_device)
+            ori_hidden_states = _snapshot(hidden_states, cache_device)
             block_id = 0
             initial_encoder_hidden_states = torch.cat([encoder_hidden_states[-1], encoder_hidden_states[-2]], dim=1)
             initial_encoder_hidden_states_seq_len = initial_encoder_hidden_states.shape[1]
@@ -381,6 +506,7 @@ def teacache_hidream_forward(
                     text_tokens = cur_encoder_hidden_states,
                     adaln_input = adaln_input,
                     rope = rope,
+                    **_supported_kwargs(type(block).forward, transformer_options=transformer_options),
                 )
                 initial_encoder_hidden_states = initial_encoder_hidden_states[:, :initial_encoder_hidden_states_seq_len]
                 block_id += 1
@@ -404,6 +530,7 @@ def teacache_hidream_forward(
                     text_tokens=None,
                     adaln_input=adaln_input,
                     rope=rope,
+                    **_supported_kwargs(type(block).forward, transformer_options=transformer_options),
                 )
                 hidden_states = hidden_states[:, :hidden_states_seq_len]
                 block_id += 1
@@ -416,27 +543,54 @@ def teacache_hidream_forward(
         output = self.unpatchify(output, img_sizes)
         return -output[:, :, :h, :w]
 
-def teacache_lumina_forward(self, x, timesteps, context, num_tokens, attention_mask=None, transformer_options={}, **kwargs):
+def teacache_lumina_forward(self, x, timesteps, context, num_tokens, attention_mask=None, ref_latents=[], ref_contexts=[], siglip_feats=[], transformer_options={}, **kwargs):
         rel_l1_thresh = transformer_options.get("rel_l1_thresh")
         coefficients = transformer_options.get("coefficients")
         cond_or_uncond = transformer_options.get("cond_or_uncond")
         enable_teacache = transformer_options.get("enable_teacache", True)
         cache_device = transformer_options.get("cache_device")
 
+        omni = len(ref_latents) > 0
+        if omni:
+            timesteps = torch.cat([timesteps * 0, timesteps], dim=0)
+
         t = 1.0 - timesteps
         cap_feats = context
         cap_mask = attention_mask
         bs, c, h, w = x.shape
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
-        
-        t = self.t_embedder(t, dtype=x.dtype)  # (N, D)
+
+        t = self.t_embedder(t * getattr(self, "time_scale", 1.0), dtype=x.dtype)  # (N, D)
         adaln_input = t
 
-        cap_feats = self.cap_embedder(cap_feats)  # (N, L, D)  # todo check if able to batchify w.o. redundant compute
+        if getattr(self, "clip_text_pooled_proj", None) is not None:
+            pooled = kwargs.get("clip_text_pooled", None)
+            if pooled is not None:
+                pooled = self.clip_text_pooled_proj(pooled)
+            else:
+                pooled = torch.zeros((x.shape[0], self.clip_text_dim), device=x.device, dtype=x.dtype)
 
+            adaln_input = self.time_text_embed(torch.cat((t, pooled), dim=-1))
+
+        patches = transformer_options.get("patches", {})
         x_is_tensor = isinstance(x, torch.Tensor)
-        x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t, num_tokens)
-        freqs_cis = freqs_cis.to(x.device)
+        embed_out = self.patchify_and_embed(
+            x, cap_feats, cap_mask, adaln_input, num_tokens,
+            **_supported_kwargs(
+                type(self).patchify_and_embed,
+                ref_latents=ref_latents,
+                ref_contexts=ref_contexts,
+                siglip_feats=siglip_feats,
+                transformer_options=transformer_options,
+            )
+        )
+        # Newer ComfyUI also returns the timestep-zero slice for omni/reference latents.
+        if len(embed_out) == 6:
+            img, mask, img_size, cap_size, freqs_cis, timestep_zero_index = embed_out
+        else:
+            img, mask, img_size, cap_size, freqs_cis = embed_out
+            timestep_zero_index = None
+        freqs_cis = freqs_cis.to(img.device)
 
         # enable teacache
         modulated_inp = t.to(cache_device)
@@ -460,7 +614,10 @@ def teacache_lumina_forward(self, x, timesteps, context, num_tokens, attention_m
                     cache['accumulated_rel_l1_distance'] = 0
             cache['previous_modulated_input'] = modulated_inp
 
-        b = int(len(x) / len(cond_or_uncond))
+        # omni doubles the timestep batch, so the modulation signal and the token stream
+        # do not necessarily share a batch size.
+        b = int(len(modulated_inp) / len(cond_or_uncond))
+        b_img = int(len(img) / len(cond_or_uncond))
 
         for i, k in enumerate(cond_or_uncond):
             update_cache_state(self.teacache_state[k], modulated_inp[i*b:(i+1)*b])
@@ -472,21 +629,43 @@ def teacache_lumina_forward(self, x, timesteps, context, num_tokens, attention_m
         else:
             should_calc = True
 
+        for k in cond_or_uncond:
+            if self.teacache_state[k]['previous_residual'] is None:
+                should_calc = True
+
         if not should_calc:
             for i, k in enumerate(cond_or_uncond):
-                x[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(x.device)
+                img[i*b_img:(i+1)*b_img] += self.teacache_state[k]['previous_residual'].to(device=img.device, dtype=img.dtype)
         else:
-            ori_x = x.to(cache_device)
+            ori_img = _snapshot(img, cache_device)
             # 2. Blocks
-            for layer in self.layers:
-                x = layer(x, mask, freqs_cis, adaln_input)
-            for i, k in enumerate(cond_or_uncond):
-                self.teacache_state[k]['previous_residual'] = (x.to(cache_device) - ori_x)[i*b:(i+1)*b]
-            
-        x = self.final_layer(x, adaln_input)
-        x = self.unpatchify(x, img_size, cap_size, return_tensor=x_is_tensor)[:,:,:h,:w]
+            transformer_options["total_blocks"] = len(self.layers)
+            transformer_options["block_type"] = "double"
+            img_input = img
+            for i, layer in enumerate(self.layers):
+                transformer_options["block_index"] = i
+                img = layer(img, mask, freqs_cis, adaln_input, **_supported_kwargs(
+                    type(layer).forward,
+                    timestep_zero_index=timestep_zero_index,
+                    transformer_options=transformer_options,
+                ))
+                if "double_block" in patches:
+                    for p in patches["double_block"]:
+                        out = p({"img": img[:, cap_size[0]:], "img_input": img_input[:, cap_size[0]:], "txt": img[:, :cap_size[0]], "pe": freqs_cis[:, cap_size[0]:], "vec": adaln_input, "x": x, "block_index": i, "transformer_options": transformer_options})
+                        if "img" in out:
+                            img[:, cap_size[0]:] = out["img"]
+                        if "txt" in out:
+                            img[:, :cap_size[0]] = out["txt"]
 
-        return -x    
+            residual = img.to(cache_device) - ori_img
+            for i, k in enumerate(cond_or_uncond):
+                self.teacache_state[k]['previous_residual'] = residual[i*b_img:(i+1)*b_img]
+
+        img = self.final_layer(img, adaln_input, **_supported_kwargs(
+            type(self.final_layer).forward, timestep_zero_index=timestep_zero_index))
+        img = self.unpatchify(img, img_size, cap_size, return_tensor=x_is_tensor)[:, :, :h, :w]
+
+        return -img
 
 def teacache_hunyuanvideo_forward(
         self,
@@ -496,13 +675,18 @@ def teacache_hunyuanvideo_forward(
         txt_ids: Tensor,
         txt_mask: Tensor,
         timesteps: Tensor,
-        y: Tensor,
+        y: Tensor = None,
+        txt_byt5=None,
+        clip_fea=None,
         guidance: Tensor = None,
         guiding_frame_index=None,
         ref_latent=None,
+        disable_time_r=False,
         control=None,
         transformer_options={},
+        **kwargs,
     ) -> Tensor:
+        transformer_options = transformer_options.copy()
         patches_replace = transformer_options.get("patches_replace", {})
         rel_l1_thresh = transformer_options.get("rel_l1_thresh")
         coefficients = transformer_options.get("coefficients")
@@ -514,6 +698,14 @@ def teacache_hunyuanvideo_forward(
         img = self.img_in(img)
         vec = self.time_in(timestep_embedding(timesteps, 256, time_factor=1.0).to(img.dtype))
 
+        if (getattr(self, "time_r_in", None) is not None) and (not disable_time_r):
+            w = torch.where(transformer_options['sigmas'][0] == transformer_options['sample_sigmas'])[0]  # This most likely could be improved
+            if len(w) > 0:
+                timesteps_r = transformer_options['sample_sigmas'][w[0] + 1]
+                timesteps_r = timesteps_r.unsqueeze(0).to(device=timesteps.device, dtype=timesteps.dtype)
+                vec_r = self.time_r_in(timestep_embedding(timesteps_r, 256, time_factor=1000.0).to(img.dtype))
+                vec = (vec + vec_r) if self.params.meanflow_sum else (vec + vec_r) / 2
+
         if ref_latent is not None:
             ref_latent_ids = self.img_ids(ref_latent)
             ref_latent = self.img_in(ref_latent)
@@ -524,13 +716,17 @@ def teacache_hunyuanvideo_forward(
 
         if guiding_frame_index is not None:
             token_replace_vec = self.time_in(timestep_embedding(guiding_frame_index, 256, time_factor=1.0))
-            vec_ = self.vector_in(y[:, :self.params.vec_in_dim])
-            vec = torch.cat([(vec_ + token_replace_vec).unsqueeze(1), (vec_ + vec).unsqueeze(1)], dim=1)
+            if getattr(self, "vector_in", None) is not None:
+                vec_ = self.vector_in(y[:, :self.params.vec_in_dim])
+                vec = torch.cat([(vec_ + token_replace_vec).unsqueeze(1), (vec_ + vec).unsqueeze(1)], dim=1)
+            else:
+                vec = torch.cat([(token_replace_vec).unsqueeze(1), (vec).unsqueeze(1)], dim=1)
             frame_tokens = (initial_shape[-1] // self.patch_size[-1]) * (initial_shape[-2] // self.patch_size[-2])
             modulation_dims = [(0, frame_tokens, 0), (frame_tokens, None, 1)]
             modulation_dims_txt = [(0, None, 1)]
         else:
-            vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
+            if getattr(self, "vector_in", None) is not None:
+                vec = vec + self.vector_in(y[:, :self.params.vec_in_dim])
             modulation_dims = None
             modulation_dims_txt = None
 
@@ -541,24 +737,54 @@ def teacache_hunyuanvideo_forward(
         if txt_mask is not None and not torch.is_floating_point(txt_mask):
             txt_mask = (txt_mask - 1).to(img.dtype) * torch.finfo(img.dtype).max
 
-        txt = self.txt_in(txt, timesteps, txt_mask)
+        txt = self.txt_in(txt, timesteps, txt_mask, **_supported_kwargs(type(self.txt_in).forward, transformer_options=transformer_options))
 
-        ids = torch.cat((img_ids, txt_ids), dim=1)
+        cond_type_embedding = getattr(self, "cond_type_embedding", None)
+        if cond_type_embedding is not None:
+            cond_type_embedding.to(txt.device)
+            cond_emb = cond_type_embedding(torch.zeros_like(txt[:, :, 0], device=txt.device, dtype=torch.long))
+            txt = txt + cond_emb.to(txt.dtype)
+
+        if getattr(self, "byt5_in", None) is not None and txt_byt5 is not None:
+            txt_byt5 = self.byt5_in(txt_byt5)
+            if cond_type_embedding is not None:
+                cond_emb = cond_type_embedding(torch.ones_like(txt_byt5[:, :, 0], device=txt_byt5.device, dtype=torch.long))
+                txt_byt5 = txt_byt5 + cond_emb.to(txt_byt5.dtype)
+                txt = torch.cat((txt_byt5, txt), dim=1) # byt5 first for HunyuanVideo1.5
+            else:
+                txt = torch.cat((txt, txt_byt5), dim=1)
+            txt_byt5_ids = torch.zeros((txt_ids.shape[0], txt_byt5.shape[1], txt_ids.shape[-1]), device=txt_ids.device, dtype=txt_ids.dtype)
+            txt_ids = torch.cat((txt_ids, txt_byt5_ids), dim=1)
+
+        if clip_fea is not None and getattr(self, "vision_in", None) is not None:
+            txt_vision_states = self.vision_in(clip_fea)
+            if cond_type_embedding is not None:
+                cond_emb = cond_type_embedding(2 * torch.ones_like(txt_vision_states[:, :, 0], dtype=torch.long, device=txt_vision_states.device))
+                txt_vision_states = txt_vision_states + cond_emb
+            txt = torch.cat((txt_vision_states.to(txt.dtype), txt), dim=1)
+            extra_txt_ids = torch.zeros((txt_ids.shape[0], txt_vision_states.shape[1], txt_ids.shape[-1]), device=txt_ids.device, dtype=txt_ids.dtype)
+            txt_ids = torch.cat((txt_ids, extra_txt_ids), dim=1)
+
+        ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
         img_len = img.shape[1]
         if txt_mask is not None:
             attn_mask_len = img_len + txt.shape[1]
             attn_mask = torch.zeros((1, 1, attn_mask_len), dtype=img.dtype, device=img.device)
-            attn_mask[:, 0, img_len:] = txt_mask
+            attn_mask[:, 0, :txt.shape[1]] = txt_mask
         else:
             attn_mask = None
 
         blocks_replace = patches_replace.get("dit", {})
 
         # enable teacache
-        img_mod1, _ = self.double_blocks[0].img_mod(vec)
-        modulated_inp = self.double_blocks[0].img_norm1(img)
+        first_block = self.double_blocks[0]
+        if getattr(first_block, "modulation", True):
+            img_mod1, _ = first_block.img_mod(vec)
+        else:
+            (img_mod1, _), _ = vec
+        modulated_inp = first_block.img_norm1(img)
         modulated_inp = apply_mod(modulated_inp, (1 + img_mod1.scale), img_mod1.shift, modulation_dims).to(cache_device)
 
         if not hasattr(self, 'accumulated_rel_l1_distance'):
@@ -578,25 +804,29 @@ def teacache_hunyuanvideo_forward(
 
         self.previous_modulated_input = modulated_inp
 
-        if not enable_teacache:
+        if not enable_teacache or getattr(self, "previous_residual", None) is None:
             should_calc = True
 
         if not should_calc:
-            img += self.previous_residual.to(img.device)
+            img += self.previous_residual.to(device=img.device, dtype=img.dtype)
         else:
-            ori_img = img.to(cache_device)
+            ori_img = _snapshot(img, cache_device)
+            transformer_options["total_blocks"] = len(self.double_blocks)
+            transformer_options["block_type"] = "double"
             for i, block in enumerate(self.double_blocks):
+                transformer_options["block_index"] = i
+                block_kwargs = _supported_kwargs(type(block).forward, transformer_options=transformer_options)
                 if ("double_block", i) in blocks_replace:
                     def block_wrap(args):
                         out = {}
-                        out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims_img=args["modulation_dims_img"], modulation_dims_txt=args["modulation_dims_txt"])
+                        out["img"], out["txt"] = block(img=args["img"], txt=args["txt"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims_img=args["modulation_dims_img"], modulation_dims_txt=args["modulation_dims_txt"], **_supported_kwargs(type(block).forward, transformer_options=args["transformer_options"]))
                         return out
 
-                    out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims_img': modulation_dims, 'modulation_dims_txt': modulation_dims_txt}, {"original_block": block_wrap})
+                    out = blocks_replace[("double_block", i)]({"img": img, "txt": txt, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims_img': modulation_dims, 'modulation_dims_txt': modulation_dims_txt, 'transformer_options': transformer_options}, {"original_block": block_wrap})
                     txt = out["txt"]
                     img = out["img"]
                 else:
-                    img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims_img=modulation_dims, modulation_dims_txt=modulation_dims_txt)
+                    img, txt = block(img=img, txt=txt, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims_img=modulation_dims, modulation_dims_txt=modulation_dims_txt, **block_kwargs)
 
                 if control is not None: # Controlnet
                     control_i = control.get("input")
@@ -605,41 +835,50 @@ def teacache_hunyuanvideo_forward(
                         if add is not None:
                             img += add
 
-            img = torch.cat((img, txt), 1)
+            img = torch.cat((txt, img), 1)
 
+            transformer_options["total_blocks"] = len(self.single_blocks)
+            transformer_options["block_type"] = "single"
+            transformer_options["img_slice"] = [txt.shape[1], img.shape[1]]
             for i, block in enumerate(self.single_blocks):
+                transformer_options["block_index"] = i
+                block_kwargs = _supported_kwargs(type(block).forward, transformer_options=transformer_options)
                 if ("single_block", i) in blocks_replace:
                     def block_wrap(args):
                         out = {}
-                        out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims=args["modulation_dims"])
+                        out["img"] = block(args["img"], vec=args["vec"], pe=args["pe"], attn_mask=args["attention_mask"], modulation_dims=args["modulation_dims"], **_supported_kwargs(type(block).forward, transformer_options=args["transformer_options"]))
                         return out
 
-                    out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims': modulation_dims}, {"original_block": block_wrap})
+                    out = blocks_replace[("single_block", i)]({"img": img, "vec": vec, "pe": pe, "attention_mask": attn_mask, 'modulation_dims': modulation_dims, 'transformer_options': transformer_options}, {"original_block": block_wrap})
                     img = out["img"]
                 else:
-                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims=modulation_dims)
+                    img = block(img, vec=vec, pe=pe, attn_mask=attn_mask, modulation_dims=modulation_dims, **block_kwargs)
 
                 if control is not None: # Controlnet
                     control_o = control.get("output")
                     if i < len(control_o):
                         add = control_o[i]
                         if add is not None:
-                            img[:, : img_len] += add
+                            img[:, txt.shape[1]: img_len + txt.shape[1]] += add
 
-            img = img[:, : img_len]
-            self.previous_residual = (img.to(cache_device) - ori_img)
+            img = img[:, txt.shape[1]: img_len + txt.shape[1]]
+            self.previous_residual = img.to(cache_device) - ori_img
 
         if ref_latent is not None:
             img = img[:, ref_latent.shape[1]:]
-        
+
         img = self.final_layer(img, vec, modulation_dims=modulation_dims)  # (N, T, patch_size ** 2 * out_channels)
 
-        shape = initial_shape[-3:]
+        shape = initial_shape[-len(self.patch_size):]
         for i in range(len(shape)):
             shape[i] = shape[i] // self.patch_size[i]
         img = img.reshape([img.shape[0]] + shape + [self.out_channels] + self.patch_size)
-        img = img.permute(0, 4, 1, 5, 2, 6, 3, 7)
-        img = img.reshape(initial_shape[0], self.out_channels, initial_shape[2], initial_shape[3], initial_shape[4])
+        if img.ndim == 8:
+            img = img.permute(0, 4, 1, 5, 2, 6, 3, 7)
+            img = img.reshape(initial_shape[0], self.out_channels, initial_shape[2], initial_shape[3], initial_shape[4])
+        else:
+            img = img.permute(0, 3, 1, 4, 2, 5)
+            img = img.reshape(initial_shape[0], self.out_channels, initial_shape[2], initial_shape[3])
         return img
 
 def teacache_ltxvmodel_forward(
@@ -751,7 +990,7 @@ def teacache_ltxvmodel_forward(
             for i, k in enumerate(cond_or_uncond):
                 x[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(x.device)
         else:
-            ori_x = x.to(cache_device)
+            ori_x = _snapshot(x, cache_device)
             for i, block in enumerate(self.transformer_blocks):
                 if ("double_block", i) in blocks_replace:
                     def block_wrap(args):
@@ -793,6 +1032,108 @@ def teacache_ltxvmodel_forward(
 
         return x
 
+def teacache_ltxv_process_transformer_blocks(
+        self,
+        x,
+        context,
+        attention_mask,
+        timestep,
+        pe,
+        transformer_options={},
+        self_attention_mask=None,
+        **kwargs
+    ):
+        """TeaCache for ComfyUI builds where LTXBaseModel splits forward() into stages.
+
+        Patching the block loop instead of the whole forward keeps every other stage
+        (patchify, rope, adaln, output projection) on ComfyUI's own code, so this survives
+        upstream changes that used to break the copied forward every release.
+        """
+        original = type(self)._process_transformer_blocks
+
+        def run_blocks(h):
+            return original(
+                self, h, context, attention_mask, timestep, pe,
+                transformer_options=transformer_options,
+                self_attention_mask=self_attention_mask,
+                **kwargs
+            )
+
+        # LTXAV hands the block stack a [video, audio] pair; nothing to cache there.
+        if not isinstance(x, torch.Tensor):
+            return run_blocks(x)
+
+        rel_l1_thresh = transformer_options.get("rel_l1_thresh")
+        coefficients = transformer_options.get("coefficients")
+        cond_or_uncond = transformer_options.get("cond_or_uncond")
+        enable_teacache = transformer_options.get("enable_teacache", True)
+        cache_device = transformer_options.get("cache_device")
+
+        if coefficients is None or cond_or_uncond is None:
+            return run_blocks(x)
+
+        batch_size = x.shape[0]
+        inp = x.to(cache_device)
+        timestep_ = timestep.to(cache_device)
+        scale_shift_table = self.transformer_blocks[0].scale_shift_table
+        num_ada_params = scale_shift_table.shape[0]
+        ada_values = scale_shift_table[None, None].to(device=timestep_.device, dtype=timestep_.dtype) + timestep_.reshape(
+            batch_size, timestep_.shape[1], num_ada_params, -1
+        )
+        # Index rather than unbind: newer LTXV blocks carry 9 ada params, not 6.
+        shift_msa, scale_msa = ada_values[:, :, 0], ada_values[:, :, 1]
+        modulated_inp = comfy.ldm.common_dit.rms_norm(inp)
+        modulated_inp = modulated_inp * (1 + scale_msa) + shift_msa
+
+        if not hasattr(self, 'teacache_state'):
+            self.teacache_state = {
+                0: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None},
+                1: {'should_calc': True, 'accumulated_rel_l1_distance': 0, 'previous_modulated_input': None, 'previous_residual': None}
+            }
+
+        def update_cache_state(cache, modulated_inp):
+            if cache['previous_modulated_input'] is not None:
+                try:
+                    cache['accumulated_rel_l1_distance'] += poly1d(coefficients, ((modulated_inp-cache['previous_modulated_input']).abs().mean() / cache['previous_modulated_input'].abs().mean()))
+                    if cache['accumulated_rel_l1_distance'] < rel_l1_thresh:
+                        cache['should_calc'] = False
+                    else:
+                        cache['should_calc'] = True
+                        cache['accumulated_rel_l1_distance'] = 0
+                except:
+                    cache['should_calc'] = True
+                    cache['accumulated_rel_l1_distance'] = 0
+            cache['previous_modulated_input'] = modulated_inp
+
+        b = int(len(x) / len(cond_or_uncond))
+
+        for i, k in enumerate(cond_or_uncond):
+            update_cache_state(self.teacache_state[k], modulated_inp[i*b:(i+1)*b])
+
+        if enable_teacache:
+            should_calc = False
+            for k in cond_or_uncond:
+                should_calc = (should_calc or self.teacache_state[k]['should_calc'])
+        else:
+            should_calc = True
+
+        for k in cond_or_uncond:
+            if self.teacache_state[k]['previous_residual'] is None:
+                should_calc = True
+
+        if not should_calc:
+            for i, k in enumerate(cond_or_uncond):
+                x[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(device=x.device, dtype=x.dtype)
+            return x
+
+        # LTXV blocks write into x in place, so the reference copy has to be a real copy.
+        ori_x = _snapshot(x, cache_device)
+        x = run_blocks(x)
+        residual = x.to(cache_device) - ori_x
+        for i, k in enumerate(cond_or_uncond):
+            self.teacache_state[k]['previous_residual'] = residual[i*b:(i+1)*b]
+        return x
+
 def teacache_wanmodel_forward(
         self,
         x,
@@ -804,6 +1145,7 @@ def teacache_wanmodel_forward(
         **kwargs,
     ):
         patches_replace = transformer_options.get("patches_replace", {})
+        patches = transformer_options.get("patches", {})
         rel_l1_thresh = transformer_options.get("rel_l1_thresh")
         coefficients = transformer_options.get("coefficients")
         cond_or_uncond = transformer_options.get("cond_or_uncond")
@@ -812,14 +1154,34 @@ def teacache_wanmodel_forward(
         cache_device = transformer_options.get("cache_device")
 
         # embeddings
+        x_input = x
         x = self.patch_embedding(x.float()).to(x.dtype)
         grid_sizes = x.shape[2:]
+        transformer_options["grid_sizes"] = grid_sizes
         x = x.flatten(2).transpose(1, 2)
 
         # time embeddings
         e = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
-        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            sinusoidal_embedding_1d(self.freq_dim, t.flatten()).to(dtype=x[0].dtype))
+        e = e.reshape(t.shape[0], -1, e.shape[-1])
+        e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+
+        full_ref = None
+        img_offset = 0
+        if getattr(self, "ref_conv", None) is not None:
+            full_ref = kwargs.get("reference_latent", None)
+            if full_ref is not None:
+                full_ref = self.ref_conv(full_ref).flatten(2).transpose(1, 2)
+                x = torch.concat((full_ref, x), dim=1)
+                img_offset = full_ref.shape[1]
+
+        # In-context reference (Bernini)
+        context_latents = kwargs.get("context_latents", None)
+        main_len = x.shape[1]
+        if context_latents is not None:
+            for lat in context_latents:
+                cl = self.patch_embedding(lat.float().to(x.device)).to(x.dtype).flatten(2).transpose(1, 2)
+                x = torch.cat([x, cl], dim=1)
 
         # context
         context = self.text_embedding(context)
@@ -854,7 +1216,7 @@ def teacache_wanmodel_forward(
                     cache['should_calc'] = True
                     cache['accumulated_rel_l1_distance'] = 0
             cache['previous_modulated_input'] = modulated_inp
-            
+
         b = int(len(x) / len(cond_or_uncond))
 
         for i, k in enumerate(cond_or_uncond):
@@ -867,26 +1229,47 @@ def teacache_wanmodel_forward(
         else:
             should_calc = True
 
+        for k in cond_or_uncond:
+            if self.teacache_state[k]['previous_residual'] is None:
+                should_calc = True
+
         if not should_calc:
             for i, k in enumerate(cond_or_uncond):
-                x[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(x.device)
+                x[i*b:(i+1)*b] += self.teacache_state[k]['previous_residual'].to(device=x.device, dtype=x.dtype)
         else:
-            ori_x = x.to(cache_device)
+            ori_x = _snapshot(x, cache_device)
+            transformer_options["total_blocks"] = len(self.blocks)
+            transformer_options["block_type"] = "double"
             for i, block in enumerate(self.blocks):
+                transformer_options["block_index"] = i
+                block_kwargs = _supported_kwargs(type(block).forward, transformer_options=transformer_options)
                 if ("double_block", i) in blocks_replace:
                     def block_wrap(args):
                         out = {}
-                        out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len)
+                        out["img"] = block(args["img"], context=args["txt"], e=args["vec"], freqs=args["pe"], context_img_len=context_img_len, **_supported_kwargs(type(block).forward, transformer_options=args["transformer_options"]))
                         return out
-                    out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs}, {"original_block": block_wrap, "transformer_options": transformer_options})
+                    out = blocks_replace[("double_block", i)]({"img": x, "txt": context, "vec": e0, "pe": freqs, "transformer_options": transformer_options}, {"original_block": block_wrap})
                     x = out["img"]
                 else:
-                    x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len)
+                    x = block(x, e=e0, freqs=freqs, context=context, context_img_len=context_img_len, **block_kwargs)
+
+                if "double_block" in patches:
+                    for p in patches["double_block"]:
+                        out = p({"img": x, "x": x_input, "vec": e, "block_index": i, "img_offset": img_offset, "transformer_options": transformer_options})
+                        x = out["img"]
+
+            residual = x.to(cache_device) - ori_x
             for i, k in enumerate(cond_or_uncond):
-                self.teacache_state[k]['previous_residual'] = (x.to(cache_device) - ori_x)[i*b:(i+1)*b]
+                self.teacache_state[k]['previous_residual'] = residual[i*b:(i+1)*b]
 
         # head
         x = self.head(x, e)
+
+        if context_latents is not None:
+            x = x[:, :main_len]
+
+        if full_ref is not None:
+            x = x[:, full_ref.shape[1]:]
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
@@ -946,10 +1329,17 @@ class TeaCache:
             )
         elif "ltxv" in model_type:
             is_cfg = True
-            context = patch.multiple(
-                diffusion_model,
-                forward=teacache_ltxvmodel_forward.__get__(diffusion_model, diffusion_model.__class__)
-            )
+            if hasattr(diffusion_model, "_process_transformer_blocks"):
+                # ComfyUI >= the LTXBaseModel refactor: hook just the block loop.
+                context = patch.multiple(
+                    diffusion_model,
+                    _process_transformer_blocks=teacache_ltxv_process_transformer_blocks.__get__(diffusion_model, diffusion_model.__class__)
+                )
+            else:
+                context = patch.multiple(
+                    diffusion_model,
+                    forward=teacache_ltxvmodel_forward.__get__(diffusion_model, diffusion_model.__class__)
+                )
         elif "hunyuan_video" in model_type:
             is_cfg = False
             context = patch.multiple(
