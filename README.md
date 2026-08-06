@@ -5,6 +5,47 @@ Timestep Embedding Aware Cache ([TeaCache](https://github.com/ali-vilab/TeaCache
 
 TeaCache has now been integrated into ComfyUI and is compatible with the ComfyUI native nodes. ComfyUI-TeaCache is easy to use, simply connect the TeaCache node with the ComfyUI native nodes for seamless usage.
 
+## MiniMax H3 Speed Optimizer (NVlabs Sana sol-engine port)
+
+This package also ships a dedicated acceleration suite for the **MiniMax H3** 33B audio-video
+Omni-DiT, ported from the [NVlabs Sana `sol-engine`](https://github.com/NVlabs/Sana/tree/sol-engine/models/minimax_h3/optimized)
+reference (whose measured full line is 3.97x on the denoise+decode hot path):
+
+- **`MiniMax H3 Speed Optimizer`** (`MODEL -> MODEL, BOOLEAN`): place between the `UNETLoader` and the
+  guider/sampler.
+  - *Master switch*: `enable_speedup=false` returns the original model without installing any
+    denoiser patches. Connect its `speedup_enabled` output to the matching input on
+    `MiniMax H3 VAE Speedup` to make one switch restore the complete non-4x path.
+  - *FirstBlockCache*: transformer block 0 runs every step; when its output residual barely
+    moved since the previous step, the remaining 49 blocks are skipped and the cached tail
+    residual is reused (the reference's dominant 2.58x stage). Threshold, schedule window,
+    and a consecutive-skip cap are exposed.
+  - *Sol-Attn sparse attention*: the packed `[text | cond | audio | video]` self-attention is
+    routed sparsely with the whole prefix as an exact KV sink and prefix query rows recomputed
+    densely (the released H3 policy: `tau=1.0`, `diag`, first 20% steps and first 2 blocks
+    dense). The vendored kernel (Apache-2.0, see `minimax_h3/sol_attn/`) uses CuTe DSL on
+    SM90/SM100/SM120 where available and Triton on every other GPU >= SM80, including RTX
+    30xx/40xx/50xx on Windows.
+  - *Per-GPU auto verification*: on the first eligible call the kernel is compiled, checked
+    against dense SDPA on the model's own tensors (route-everything must match bit-closely),
+    and micro-benchmarked against your current attention backend (e.g. SageAttention). It is
+    kept only where it is both correct and faster; otherwise that GPU silently keeps its
+    incumbent attention. Any sparse-path exception permanently falls back to dense for the
+    process.
+- **`MiniMax H3 VAE Speedup`** (`VAE -> VAE`): place after the video `VAELoader`. Feeds the
+  identical-shape spatial decode tiles through the ViT decoder as one batch instead of one
+  launch per tile — same arithmetic, up to ~2x faster decode. Measured bit-identical on RTX
+  5090; on GPUs whose GEMM kernel selection differs by batch size (e.g. RTX 3090) the
+  deviation is fp16 rounding only (measured max 2.4e-4 — far below one 8-bit pixel step).
+  Batch size auto-sizes to free VRAM (with an OOM-safe sequential fallback) or can be fixed.
+  The node patches a shallow VAE copy, leaving the loader's cached VAE untouched, so disabling
+  the shared master switch after an accelerated run still uses the original decoder.
+
+Notes: the AdaLN-precompute stage of the reference line is already baked into ComfyUI's H3
+checkpoints (`adaln_t_table` curve basis), and ComfyUI core already fuses QKV projection,
+RMSNorm+partial-RoPE and SwiGLU via comfy-kitchen, so those stages are not duplicated here.
+The first sparse run pays a one-time Triton compile (~10 s, cached on disk afterwards).
+
 ## Updates
 - Jul 11 2025: ComfyUI-TeaCache supports FLUX-Kontext:
     - It can achieve a 1.5x lossless speedup and a 2x speedup without much visual quality degradation for FLUX-Kontext.
