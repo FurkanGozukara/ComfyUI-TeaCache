@@ -12,12 +12,42 @@ so the fc1 delta halves are swapped to match.
 Wrapping comfy.lora.model_lora_keys_unet here makes the plain LoraLoader /
 LoraLoaderModelOnly nodes (and therefore SwarmUI's lora handling) apply these
 LoRAs to every H3 checkpoint variant, including the quantized pruned ones.
+
+These PEFT exports carry no alpha keys, so ComfyUI would apply them at
+alpha == rank while the distill's calibrated application scale is rank/8
+(strength 1.0 fries the model, 0.125 is the sweet spot). convert_lora is
+wrapped to inject alpha = rank/8 per module, so a user-facing strength of
+1.0 lands on the calibrated scale and the strength dial stays intuitive.
 """
 
 import torch
 
 import comfy.lora
+import comfy.lora_convert
 import comfy.model_base
+
+# H3-specific PEFT-export signature: the token refiner module path only exists on
+# this architecture, and the ".default" adapter suffix marks a raw PEFT dump.
+_PEFT_MARKER = "token_refiner.refiner_blocks.0.attn.to_q.lora_A.default.weight"
+_TRAINED_ALPHA_RATIO = 0.125  # effective trained alpha / rank of the lightx2v turbo exports
+
+
+def _inject_peft_alpha(sd):
+    """Add alpha = rank/8 to alpha-less MiniMax H3 PEFT loras.
+
+    Only fires on the H3 PEFT signature and never overrides explicit alphas,
+    so every other lora format and architecture passes through untouched.
+    """
+    if _PEFT_MARKER not in sd:
+        return sd
+    if any(k.endswith(".alpha") for k in sd):
+        return sd
+    out = dict(sd)
+    suffix = ".lora_A.default.weight"
+    for k, v in sd.items():
+        if k.endswith(suffix):
+            out[k[:-len(suffix)] + ".alpha"] = torch.tensor(v.shape[0] * _TRAINED_ALPHA_RATIO)
+    return out
 
 
 def _swiglu_swap(diff):
@@ -49,15 +79,23 @@ def _add_minimax_h3_keys(model, sd, key_map):
 
 
 def install():
-    if getattr(comfy.lora.model_lora_keys_unet, "_minimax_h3_lora_hook", False):
-        return
-    original = comfy.lora.model_lora_keys_unet
+    if not getattr(comfy.lora.model_lora_keys_unet, "_minimax_h3_lora_hook", False):
+        original = comfy.lora.model_lora_keys_unet
 
-    def model_lora_keys_unet(model, key_map={}):
-        key_map = original(model, key_map)
-        if isinstance(model, comfy.model_base.MiniMaxH3):
-            _add_minimax_h3_keys(model, model.state_dict(), key_map)
-        return key_map
+        def model_lora_keys_unet(model, key_map={}):
+            key_map = original(model, key_map)
+            if isinstance(model, comfy.model_base.MiniMaxH3):
+                _add_minimax_h3_keys(model, model.state_dict(), key_map)
+            return key_map
 
-    model_lora_keys_unet._minimax_h3_lora_hook = True
-    comfy.lora.model_lora_keys_unet = model_lora_keys_unet
+        model_lora_keys_unet._minimax_h3_lora_hook = True
+        comfy.lora.model_lora_keys_unet = model_lora_keys_unet
+
+    if not getattr(comfy.lora_convert.convert_lora, "_minimax_h3_lora_hook", False):
+        original_convert = comfy.lora_convert.convert_lora
+
+        def convert_lora(sd):
+            return original_convert(_inject_peft_alpha(sd))
+
+        convert_lora._minimax_h3_lora_hook = True
+        comfy.lora_convert.convert_lora = convert_lora
