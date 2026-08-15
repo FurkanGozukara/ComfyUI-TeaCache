@@ -46,6 +46,39 @@ checkpoints (`adaln_t_table` curve basis), and ComfyUI core already fuses QKV pr
 RMSNorm+partial-RoPE and SwiGLU via comfy-kitchen, so those stages are not duplicated here.
 The first sparse run pays a one-time Triton compile (~10 s, cached on disk afterwards).
 
+## MiniMax H3 Face Inpaint (YOLO face refinement)
+
+A second-pass face refinement pipeline for MiniMax H3 videos: detect and track the
+subject's face in every generated frame with a YOLO face model, crop it to a stabilised
+constant-size canvas, regenerate the crops with the same H3 model as ordinary img2img
+(the generated audio latent is copied over and frozen, so speech and lipsync are
+preserved exactly), then warp the refined faces back with feathered, colour-matched
+compositing. Adapted from [Carasibana/ComfyUI-H3-FaceRefine](https://github.com/Carasibana/ComfyUI-H3-FaceRefine) (MIT).
+
+Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
+
+- **`MiniMax H3 Face Track + Crop`**: per-frame YOLO face detection (models from the
+  shared `models/yolov8` folder, e.g. `yolov9e-face-lindevs.pt`), gap interpolation,
+  Gaussian trajectory smoothing, sub-pixel affine crops and an auto-sized refine canvas
+  (384-768). Optional identity tracking holds one subject through crowds via InsightFace
+  embeddings, consulted only on ambiguous frames; it degrades gracefully to continuity
+  tracking when InsightFace is unavailable. An optional body-detector fallback estimates
+  the head position on frames where the subject faces away.
+- **`MiniMax H3 Face Inject Video Latent`**: VAE-encodes the crops into the video stream
+  of a joint AV latent, turning the refine pass into ordinary img2img.
+- **`MiniMax H3 Face Audio Lock`**: copies the audio stream of the first pass's sampled
+  latent into the refine latent bit-exact and freezes it via the noise mask (video
+  denoises, audio never changes) - this is what keeps speech and lipsync intact.
+- **`MiniMax H3 Face Per-Frame Denoise`**: scales denoise strength per frame inversely to
+  face size, so tiny faces get fully re-synthesised while large faces keep their detail.
+- **`MiniMax H3 Face Stitch Back`**: batched sub-pixel warp back onto the source frames
+  with dilated + Gaussian-feathered face masks, per-channel colour matching, and fade-out
+  over frames where no face was found.
+- **`MiniMax H3 Face Transform Info`**: prints the per-frame transform for debugging.
+
+The SECourses MiniMax H3 presets ship an "Optional Face Inpaint" subgraph built from
+these nodes; it is off by default and costs nothing while disabled.
+
 ## Updates
 - Jul 11 2025: ComfyUI-TeaCache supports FLUX-Kontext:
     - It can achieve a 1.5x lossless speedup and a 2x speedup without much visual quality degradation for FLUX-Kontext.

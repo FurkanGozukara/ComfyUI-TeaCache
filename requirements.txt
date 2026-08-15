@@ -1,2 +1,4 @@
 einops >= 0.7.0
 diffusers >= 0.31.0
+ultralytics >= 8.3.0
+scipy >= 1.11.0
