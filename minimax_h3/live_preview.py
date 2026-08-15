@@ -40,6 +40,9 @@ from comfy_api.latest import io as comfy_io
 from comfy_execution.utils import get_executing_context
 from server import PromptServer
 
+# ComfyUI builds without MiniMax H3 have no H3 latent format: nothing to preview, nothing to hook.
+H3_LATENT_FORMAT = getattr(comfy.latent_formats, "MiniMaxH3Video", None)
+
 NODE_ID = "MiniMaxH3LivePreview"
 EVENT = "minimax_h3_live_preview"
 LATENT_FPS = 24 * 5 / 17
@@ -185,7 +188,7 @@ _stock_prepare_callback = latent_preview.prepare_callback
 
 def prepare_callback(model, steps, x0_output_dict=None, *args, **kwargs):
     callback = _stock_prepare_callback(model, steps, x0_output_dict, *args, **kwargs)
-    if not isinstance(model.model.latent_format, comfy.latent_formats.MiniMaxH3Video):
+    if not isinstance(model.model.latent_format, H3_LATENT_FORMAT):
         return callback
     node_ids = _preview_node_ids()
     if not node_ids:
@@ -201,7 +204,7 @@ def prepare_callback(model, steps, x0_output_dict=None, *args, **kwargs):
     return live_callback
 
 
-if not getattr(latent_preview.prepare_callback, "_minimax_h3_live_preview", False):
+if H3_LATENT_FORMAT is not None and not getattr(latent_preview.prepare_callback, "_minimax_h3_live_preview", False):
     prepare_callback._minimax_h3_live_preview = True
     latent_preview.prepare_callback = prepare_callback
 
@@ -234,10 +237,6 @@ class MiniMaxH3LivePreview(comfy_io.ComfyNode):
         return comfy_io.NodeOutput(value)
 
 
-NODE_CLASS_MAPPINGS = {
-    NODE_ID: MiniMaxH3LivePreview,
-}
+NODE_CLASS_MAPPINGS = {NODE_ID: MiniMaxH3LivePreview} if H3_LATENT_FORMAT is not None else {}
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    NODE_ID: "MiniMax H3 Live Preview",
-}
+NODE_DISPLAY_NAME_MAPPINGS = {NODE_ID: "MiniMax H3 Live Preview"} if H3_LATENT_FORMAT is not None else {}
