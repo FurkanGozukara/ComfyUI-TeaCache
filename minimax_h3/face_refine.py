@@ -23,6 +23,38 @@ import torch
 import comfy.nested_tensor
 import folder_paths
 
+DEFAULT_FACE_REFINEMENT_PROMPT = (
+    "Preserve the exact same identity, expression, head pose, and facial proportions. "
+    "Resolve natural coherent eyes, skin texture, beard strands, and hair detail. "
+    "No identity change, beautification, or facial reshaping."
+)
+
+
+def _append_face_refinement_prompt(prompt, refinement_prompt):
+    base = str(prompt or "").rstrip()
+    addition = str(refinement_prompt or "").strip()
+    if not addition or addition.casefold() in base.casefold():
+        return base
+    return f"{base}\n\n{addition}" if base else addition
+
+
+def _face_heights_from_transform(transform):
+    boxes = transform.get("boxes", [])
+    stored = transform.get("face_height_src")
+    if stored is not None and len(stored) == len(boxes):
+        return np.asarray(stored, dtype=np.float64)
+    crop_factor = float(transform.get("crop_factor", 3.0)) or 3.0
+    return np.asarray([box[3] / crop_factor for box in boxes], dtype=np.float64)
+
+
+def _size_aware_stitch_weights(face_heights, full_refine_px, passthrough_px):
+    heights = np.asarray(face_heights, dtype=np.float64)
+    lo = float(full_refine_px)
+    hi = max(float(passthrough_px), lo + 1e-6)
+    t = np.clip((heights - lo) / (hi - lo), 0.0, 1.0)
+    smoothstep = t * t * (3.0 - 2.0 * t)
+    return 1.0 - smoothstep
+
 # ----------------------------------------------------------------------------
 # detector helpers
 # ----------------------------------------------------------------------------
@@ -311,7 +343,106 @@ def _feather_mask(h, w, feather, device, dtype):
 
 
 # ----------------------------------------------------------------------------
-# 1. track + crop
+# 1. face-specific prompt
+# ----------------------------------------------------------------------------
+
+
+class MiniMaxH3FacePromptEnhance:
+    """Append conservative face-detail instructions to the second-pass prompt."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"forceInput": True}),
+                "refinement_prompt": ("STRING", {
+                    "default": DEFAULT_FACE_REFINEMENT_PROMPT,
+                    "multiline": True,
+                    "tooltip": "Instructions used only for the face-refinement pass. Keep identity, pose, and expression locked.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Refinement Prompt"
+    DESCRIPTION = "Append identity-preserving detail instructions for the face-only pass."
+
+    def run(self, prompt, refinement_prompt=DEFAULT_FACE_REFINEMENT_PROMPT):
+        return (_append_face_refinement_prompt(prompt, refinement_prompt),)
+
+
+# These face-specific wrappers make the actual 0.60 pass denoise distinct from
+# the per-frame size multipliers and give the preset stable, explicit defaults.
+class MiniMaxH3FaceSamplerSelect:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+
+        names = list(comfy.samplers.SAMPLER_NAMES)
+        preferred = "res_multistep"
+        if preferred in names:
+            names.remove(preferred)
+            names.insert(0, preferred)
+        return {"required": {"sampler_name": (names,)}}
+
+    RETURN_TYPES = ("SAMPLER",)
+    RETURN_NAMES = ("sampler",)
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Sampler"
+    DESCRIPTION = "Sampler selector for the face-refinement pass."
+
+    def run(self, sampler_name):
+        import comfy.samplers
+
+        return (comfy.samplers.sampler_object(sampler_name),)
+
+
+class MiniMaxH3FaceScheduler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+
+        schedulers = list(comfy.samplers.SCHEDULER_NAMES)
+        preferred = "beta"
+        if preferred in schedulers:
+            schedulers.remove(preferred)
+            schedulers.insert(0, preferred)
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "scheduler": (schedulers,),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "denoise": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Actual face-pass denoise. Recommended: 0.60. Per-frame size multipliers scale this value."}),
+            },
+        }
+
+    RETURN_TYPES = ("SIGMAS",)
+    RETURN_NAMES = ("sigmas",)
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Scheduler"
+    DESCRIPTION = "Build the face-pass sigma schedule with an explicit 0.60 denoise default."
+
+    def run(self, model, scheduler, steps, denoise):
+        import comfy.samplers
+
+        steps = int(steps)
+        denoise = float(denoise)
+        if denoise <= 0.0:
+            return (torch.FloatTensor([]),)
+        total_steps = steps if denoise >= 1.0 else int(steps / denoise)
+        sigmas = comfy.samplers.calculate_sigmas(
+            model.get_model_object("model_sampling"), scheduler, total_steps).cpu()
+        return (sigmas[-(steps + 1):],)
+
+
+# ----------------------------------------------------------------------------
+# 2. track + crop
 # ----------------------------------------------------------------------------
 
 
@@ -332,8 +463,8 @@ class MiniMaxH3FaceTrackCrop:
                 "detector": (_detector_list(), {"tooltip": "YOLO face model from models/yolov8 (yolov9e-face-lindevs.pt recommended)."}),
                 "confidence": ("FLOAT", {"default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05,
                     "tooltip": "Minimum detection confidence. Lower finds more distant/blurry faces at the cost of false positives."}),
-                "crop_factor": ("FLOAT", {"default": 2.5, "min": 1.2, "max": 8.0, "step": 0.1,
-                    "tooltip": "Crop side as a multiple of detected face HEIGHT. 2.5 puts the face at ~40% of the crop. "
+                "crop_factor": ("FLOAT", {"default": 2.2, "min": 1.2, "max": 8.0, "step": 0.1,
+                    "tooltip": "Crop side as a multiple of detected face HEIGHT. 2.2 puts the face at ~45% of the crop. "
                                "Bigger = more context so the seam lands in hair/background, but less magnification. 2.0-3.0 is the useful range."}),
                 "canvas_mode": (["auto_capped_768", "auto_no_downscale", "manual"],
                     {"default": "auto_capped_768",
@@ -608,6 +739,7 @@ class MiniMaxH3FaceTrackCrop:
                 )
                 for i, b in enumerate(boxes)
             ],
+            "face_height_src": [float(v) for v in sz],
             "crop_factor": float(crop_factor),
         }
 
@@ -650,7 +782,7 @@ class MiniMaxH3FaceTrackCrop:
 
 
 # ----------------------------------------------------------------------------
-# 2. inject real video into the AV latent (img2img seed)
+# 3. inject real video into the AV latent (img2img seed)
 # ----------------------------------------------------------------------------
 
 
@@ -731,7 +863,7 @@ class MiniMaxH3FaceInjectVideoLatent:
 
 
 # ----------------------------------------------------------------------------
-# 3. lock the audio stream to the first pass (keeps speech + lipsync)
+# 4. lock the audio stream to the first pass (keeps speech + lipsync)
 # ----------------------------------------------------------------------------
 
 
@@ -809,7 +941,7 @@ class MiniMaxH3FaceAudioLock:
 
 
 # ----------------------------------------------------------------------------
-# 4. per-frame denoise strength by face size
+# 5. per-frame denoise strength by face size
 # ----------------------------------------------------------------------------
 
 
@@ -830,13 +962,13 @@ class MiniMaxH3FacePerFrameDenoise:
                 "av_latent": ("LATENT",),
                 "transform": ("H3FACEXFORM",),
                 "strength_small_face": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Denoise multiplier where the face is SMALLEST. 1.0 = the full denoise set on the scheduler."}),
-                "strength_large_face": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "Denoise multiplier where the face is LARGEST. Lower preserves the detail those frames already have."}),
+                    "tooltip": "SIZE MULTIPLIER, not another denoise setting. 1.0 x the recommended 0.60 face pass = 0.60 effective denoise."}),
+                "strength_large_face": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "SIZE MULTIPLIER for large faces. 0.25 x the recommended 0.60 face pass = 0.15 effective denoise."}),
                 "scale_mode": (["absolute_px", "relative_to_clip"], {"default": "absolute_px"}),
-                "face_px_small": ("FLOAT", {"default": 30.0, "min": 4.0, "max": 400.0, "step": 1.0,
+                "face_px_small": ("FLOAT", {"default": 60.0, "min": 4.0, "max": 400.0, "step": 1.0,
                     "tooltip": "Face height (source px) at or below which the full small-face strength applies."}),
-                "face_px_large": ("FLOAT", {"default": 120.0, "min": 8.0, "max": 800.0, "step": 1.0,
+                "face_px_large": ("FLOAT", {"default": 150.0, "min": 8.0, "max": 800.0, "step": 1.0,
                     "tooltip": "Face height (source px) at or above which the large-face strength applies."}),
                 "gamma": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 4.0, "step": 0.1}),
                 "smooth_frames": ("INT", {"default": 9, "min": 1, "max": 61, "step": 2}),
@@ -847,8 +979,8 @@ class MiniMaxH3FacePerFrameDenoise:
     RETURN_NAMES = ("av_latent", "report")
     FUNCTION = "run"
     CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
-    TITLE = "MiniMax H3 Face Per-Frame Denoise"
-    DESCRIPTION = "Per-frame denoise strength, scaled inversely to face size."
+    TITLE = "MiniMax H3 Face Size Multipliers"
+    DESCRIPTION = "Multiply the face-pass denoise by face size: 1.0 for small faces, 0.25 for large faces."
 
     def run(self, av_latent, transform, strength_small_face, strength_large_face,
             scale_mode, face_px_small, face_px_large, gamma, smooth_frames):
@@ -864,9 +996,7 @@ class MiniMaxH3FacePerFrameDenoise:
         video = members[0]
         latent_t = video.shape[-3]
 
-        boxes = transform["boxes"]
-        cf = float(transform.get("crop_factor", 3.0)) or 3.0
-        face = np.array([b[3] / cf for b in boxes], dtype=np.float64)
+        face = _face_heights_from_transform(transform)
         if face.size == 0:
             raise ValueError("transform has no boxes")
 
@@ -916,7 +1046,7 @@ class MiniMaxH3FacePerFrameDenoise:
 
 
 # ----------------------------------------------------------------------------
-# 5. stitch back
+# 6. stitch back
 # ----------------------------------------------------------------------------
 
 
@@ -953,6 +1083,12 @@ class MiniMaxH3FaceStitch:
             "optional": {
                 "feather_scales_with_crop": ("BOOLEAN", {"default": False,
                     "tooltip": "Treat feather as canvas pixels instead (blend narrows as the crop shrinks). Leave off."}),
+                "size_aware_blend": ("BOOLEAN", {"default": True,
+                    "tooltip": "Fade the refined patch out as the source face becomes large enough to already contain useful detail."}),
+                "full_refine_face_px": ("FLOAT", {"default": 60.0, "min": 4.0, "max": 800.0, "step": 1.0,
+                    "tooltip": "Source-face height at or below which the generated face is stitched at full strength."}),
+                "passthrough_face_px": ("FLOAT", {"default": 180.0, "min": 8.0, "max": 1200.0, "step": 1.0,
+                    "tooltip": "Source-face height at or above which original pixels are kept, avoiding a needless VAE round trip."}),
                 "masks": ("MASK", {
                     "tooltip": "Optional per-frame paste masks in canvas space. Overrides paste_region."}),
             },
@@ -967,7 +1103,8 @@ class MiniMaxH3FaceStitch:
 
     def run(self, base_images, refined_crops, transform, paste_region, mask_dilation, feather,
             colour_match, blend, undetected_frames="fade_out", masks=None,
-            feather_scales_with_crop=False):
+            feather_scales_with_crop=False, size_aware_blend=True,
+            full_refine_face_px=60.0, passthrough_face_px=180.0):
         boxes = transform["boxes"]
         if undetected_frames == "composite_anyway":
             weights = None
@@ -985,6 +1122,19 @@ class MiniMaxH3FaceStitch:
         cw, ch = transform["canvas"]
         W, H = transform["src_size"]
         face_rects = transform.get("face_rect")
+        size_weights = None
+        if size_aware_blend:
+            face_heights = _face_heights_from_transform(transform)[:B]
+            size_weights = _size_aware_stitch_weights(
+                face_heights, full_refine_face_px, passthrough_face_px)
+            full = int(np.count_nonzero(size_weights >= 1.0 - 1e-6))
+            skipped = int(np.count_nonzero(size_weights <= 1e-6))
+            faded = int(B - full - skipped)
+            print(
+                f"[MiniMaxH3Face] size-aware stitch: full={full}, fade={faded}, "
+                f"original-only={skipped}, mean refine opacity={size_weights.mean():.2f} "
+                f"({float(full_refine_face_px):.0f}-{float(passthrough_face_px):.0f}px)"
+            )
 
         import comfy.model_management as mm
 
@@ -1071,6 +1221,10 @@ class MiniMaxH3FaceStitch:
                 for j, i in enumerate(range(c0, c1)):
                     if i < len(weights):
                         wv[j] *= float(weights[i])
+            if size_weights is not None:
+                for j, i in enumerate(range(c0, c1)):
+                    if i < len(size_weights):
+                        wv[j] *= float(size_weights[i])
             mm_ = m * wv
 
             out[c0:c1] = ((1.0 - mm_) * base + mm_ * patch).to(out.device, dt)
@@ -1079,7 +1233,7 @@ class MiniMaxH3FaceStitch:
 
 
 # ----------------------------------------------------------------------------
-# 6. debug info
+# 7. debug info
 # ----------------------------------------------------------------------------
 
 
@@ -1113,6 +1267,9 @@ class MiniMaxH3FaceTransformInfo:
 
 
 NODE_CLASS_MAPPINGS = {
+    "MiniMaxH3FacePromptEnhance": MiniMaxH3FacePromptEnhance,
+    "MiniMaxH3FaceSamplerSelect": MiniMaxH3FaceSamplerSelect,
+    "MiniMaxH3FaceScheduler": MiniMaxH3FaceScheduler,
     "MiniMaxH3FaceTrackCrop": MiniMaxH3FaceTrackCrop,
     "MiniMaxH3FaceInjectVideoLatent": MiniMaxH3FaceInjectVideoLatent,
     "MiniMaxH3FaceAudioLock": MiniMaxH3FaceAudioLock,

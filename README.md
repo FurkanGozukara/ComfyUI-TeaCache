@@ -57,6 +57,9 @@ compositing. Adapted from [Carasibana/ComfyUI-H3-FaceRefine](https://github.com/
 
 Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
 
+- **`MiniMax H3 Face Refinement Prompt`**: appends a face-only prompt that asks for
+  coherent eyes, skin, beard and hair detail while explicitly preserving identity,
+  expression, pose and facial proportions.
 - **`MiniMax H3 Face Track + Crop`**: per-frame YOLO face detection (models from the
   shared `models/yolov8` folder, e.g. `yolov9e-face-lindevs.pt`), gap interpolation,
   Gaussian trajectory smoothing, sub-pixel affine crops and an auto-sized refine canvas
@@ -69,11 +72,21 @@ Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
 - **`MiniMax H3 Face Audio Lock`**: copies the audio stream of the first pass's sampled
   latent into the refine latent bit-exact and freezes it via the noise mask (video
   denoises, audio never changes) - this is what keeps speech and lipsync intact.
-- **`MiniMax H3 Face Per-Frame Denoise`**: scales denoise strength per frame inversely to
+- **`MiniMax H3 Face Size Multipliers`**: scales denoise strength per frame inversely to
   face size, so tiny faces get fully re-synthesised while large faces keep their detail.
+  The presets use one actual face-pass denoise value of `0.60`, then a 60-150 px size
+  multiplier ramp from `1.0` to `0.25`. Therefore the effective denoise is `0.60` for a
+  small face and `0.15` for a large face; the displayed `1.0` is a multiplier, not a
+  second denoise setting.
+- **`MiniMax H3 Face Sampler` / `MiniMax H3 Face Scheduler`**: preset-safe wrappers for
+  the sampler and sigma schedule. The scheduler exposes the real face-pass denoise with
+  an explicit `0.60` default, separate from the size-multiplier controls.
 - **`MiniMax H3 Face Stitch Back`**: batched sub-pixel warp back onto the source frames
   with dilated + Gaussian-feathered face masks, per-channel colour matching, and fade-out
-  over frames where no face was found.
+  over frames where no face was found. Size-aware blending uses the refined result fully
+  at 60 px and below, fades it smoothly, and keeps original pixels at 180 px and above;
+  this prevents the face pass from softening an already-detailed close-up through an
+  unnecessary VAE round trip.
 - **`MiniMax H3 Face Transform Info`**: prints the per-frame transform for debugging.
 
 The SECourses MiniMax H3 presets ship an "Optional Face Inpaint" subgraph built from
