@@ -79,6 +79,29 @@ Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
 The SECourses MiniMax H3 presets ship an "Optional Face Inpaint" subgraph built from
 these nodes; it is off by default and costs nothing while disabled.
 
+## MiniMax H3 Live Preview (animated latent preview while sampling)
+
+- **`MiniMax H3 Live Preview`** (`value -> value`, category `TeaCache/MiniMaxH3`): a typed
+  passthrough (VIDEO or IMAGE) that shows an animated preview of the video stream on the node
+  after every sampler step. Route the final video (or image) through it right before the output
+  node; the value passes through unchanged. Playback runs at the latent frame rate
+  (24 fps * 5 / 17, H3 codes 17 pixel frames per 5 latent frames), with pause and 0.5x/1x/2x
+  speed buttons and a status line (step, frame count, seconds per step, ETA).
+  - Zero-cost by design: the frames come from ComfyUI's own `latent_rgb_factors` for H3, a
+    24 -> 3 projection of the x0 latents that are already on the GPU. There is no tiny VAE
+    or extra model, the transient output is about a megabyte and is allocated between steps
+    (peak VRAM does not change), and the sprite-sheet JPEG encoding runs on a background
+    thread. Measured on an RTX 5090 at 864x480 / 5 s / 8 steps: 1.85-1.87 s/step with the
+    preview on and off.
+  - The preview is produced by wrapping `latent_preview.prepare_callback`; the wrapper acts
+    only when the sampled model uses the MiniMax H3 latent format and the running prompt
+    contains an enabled `MiniMax H3 Live Preview` node. Every other model, and prompts
+    without the node, run the stock callback. It coexists with ComfyUI's own single-frame
+    preview (`Settings > Execution > Live preview method`), which stays under the user's
+    control.
+  - The SECourses MiniMax H3 video and image presets place this node right before the
+    output node. Switch it off (or bypass it) to send nothing.
+
 ## Updates
 - Jul 11 2025: ComfyUI-TeaCache supports FLUX-Kontext:
     - It can achieve a 1.5x lossless speedup and a 2x speedup without much visual quality degradation for FLUX-Kontext.
