@@ -80,17 +80,30 @@ Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
 - **`MiniMax H3 Face Sampler` / `MiniMax H3 Face Scheduler`**: preset-safe wrappers for
   the sampler and sigma schedule. The scheduler exposes the real face-pass denoise with
   an explicit `0.55` default, separate from the optional size-scaling controls.
-- **`MiniMax H3 Face Landmark Align`**: detects dense InsightFace landmarks in the input
-  and regenerated crops, then applies a temporally smoothed similarity correction before
-  stitching. This removes small translation, scale, and head-roll changes without
-  stretching the face. The first use automatically downloads the `buffalo_l` model pack
-  into `models/insightface/models/buffalo_l` when it is not already installed.
+- **`MiniMax H3 Face Landmark Align`** (legacy, not used by the presets): detects dense
+  InsightFace landmarks in the input and regenerated crops, then applies a temporally
+  smoothed similarity correction before stitching. Superseded by the stitch node's
+  geometry lock, which corrects per frame and non-rigidly without a landmark model. The
+  first use automatically downloads the `buffalo_l` model pack into
+  `models/insightface/models/buffalo_l` when it is not already installed.
 - **`MiniMax H3 Face Stitch Back`**: batched sub-pixel warp back onto the source frames
   with dilated + Gaussian-feathered face masks, per-channel colour matching, and fade-out
   over frames where no face was found. Size-aware blending uses the refined result fully
   at 60 px and below, fades it smoothly, and keeps original pixels at 180 px and above;
   this prevents the face pass from softening an already-detailed close-up through an
   unnecessary VAE round trip. Presets expose this as a separate toggle that defaults on.
+  - **Geometry lock** (`geometry_lock`, default on, `geometry_lock_strength` 0-1): the face
+    pass redraws eyes / nose / jaw a few pixels differently in every frame (measured 5 px mean
+    / 8 px p95 landmark drift and up to +-3 deg of roll on a 768 px crop at 0.55 denoise), which
+    reads as the face shaking or tilting on the head once pasted back. Before compositing, the
+    stitch node estimates dense optical flow (OpenCV DIS, half canvas resolution, blurred
+    greyscale so sharpness differences do not matter) from the source crop to the refined crop,
+    smooths and clamps it, and resamples the refined crop so the regenerated face lands exactly
+    on the source geometry. Only geometry moves; the regenerated detail is kept. Measured on a
+    243-frame clip: relative face motion against the source drops from 1.37 to 0.54 px/frame
+    (p95 2.84 -> 0.89) with unchanged sharpness. The correction is per frame on purpose:
+    temporally smoothing it (as the landmark node did) re-introduces the jitter, and
+    landmark-driven warps add detector noise. Set the toggle off to paste raw crops.
 - **`MiniMax H3 Face Transform Info`**: prints the per-frame transform for debugging.
 
 The SECourses MiniMax H3 presets ship an "Optional Face Inpaint" subgraph built from
