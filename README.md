@@ -67,6 +67,18 @@ Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
   embeddings, consulted only on ambiguous frames; it degrades gracefully to continuity
   tracking when InsightFace is unavailable. An optional body-detector fallback estimates
   the head position on frames where the subject faces away.
+  - **`faces`** (text, default `1`): which face(s) to refine. Every face in the clip is
+    tracked and ranked by size - `1` = the biggest (average detected face height over the
+    clip, ties go to the face on screen longer), `2` = second biggest, ... `1` keeps the
+    classic single-subject path exactly as before; `2` refines only the second biggest,
+    `1,3` faces 1 and 3, `all` every detected face. Spaces, `;` and case do not matter
+    (` 1, 3 `, `ALL`); ranks that do not exist are skipped with a log line, and if none of the
+    requested faces exist the node stops with a clear message. Selected faces are emitted as
+    **one crop batch + one transform per face** (`OUTPUT_IS_LIST`), so ComfyUI runs the inject,
+    audio-lock, sampler and decode nodes once per face - sequentially, because the H3 model
+    only samples batch size 1 - and the stitch node collects them (`INPUT_IS_LIST`). Time
+    scales with the face count, VRAM does not. The tracking preview tags each selected face
+    with its rank (#1 green, #2 cyan, #3 yellow, ...).
 - **`MiniMax H3 Face Inject Video Latent`**: VAE-encodes the crops into the video stream
   of a joint AV latent, turning the refine pass into ordinary img2img.
 - **`MiniMax H3 Face Audio Lock`**: copies the audio stream of the first pass's sampled
@@ -104,6 +116,14 @@ Nodes (category `TeaCache/MiniMaxH3/FaceInpaint`):
     (p95 2.84 -> 0.89) with unchanged sharpness. The correction is per frame on purpose:
     temporally smoothing it (as the landmark node did) re-introduces the jitter, and
     landmark-driven warps add detector noise. Set the toggle off to paste raw crops.
+  - **Other-face guard** (`suppress_other_faces`, default on): the face detector compares
+    every regenerated crop with its input crop - the same faces must be in the same places.
+    A neighbour's face that falls inside the crop is cut out of the paste (it keeps its
+    original pixels), a face H3 invented beside the subject is cut out too, and frames where
+    H3 rewrote the head (new pose / size, IoU < 0.45 with the input face) or painted a face over
+    the subject are not pasted at all - they fade back to the original. Measured on a
+    three-person clip this removed every hallucinated face; on a clean single-subject clip it
+    triggers on zero frames.
 - **`MiniMax H3 Face Transform Info`**: prints the per-frame transform for debugging.
 
 The SECourses MiniMax H3 presets ship an "Optional Face Inpaint" subgraph built from

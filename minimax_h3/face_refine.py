@@ -477,6 +477,83 @@ def _geometry_lock(source_crops: torch.Tensor, refined_crops: torch.Tensor, stre
     return locked, float(np.linalg.norm(flows, axis=3).mean())
 
 
+def _scan_other_faces(model, source_crops, refined_crops, face_rects, confidence):
+    """Sanity-check every regenerated crop against its input crop with the face detector.
+
+    Rule: the regenerated crop must contain the same faces in the same places as the input.
+    - the subject = input detection overlapping the tracked face rectangle; its regenerated
+      counterpart must overlap it well (IoU >= 0.45), otherwise H3 rewrote the head (new
+      pose / size / another person on top) -> that frame is not pasted (fades to original)
+    - a regenerated face with an input counterpart elsewhere is a real neighbour -> its box is
+      cut out of the paste so the neighbour keeps its original pixels
+    - a regenerated face with no input counterpart is a hallucination -> cut if it is beside
+      the subject, or the frame is not pasted if it collides with the subject
+    Returns (cuts per frame [xyxy boxes], per-frame paste weight, cut count, dropped-frame count).
+    """
+    n = refined_crops.shape[0]
+    cuts = [[] for _ in range(n)]
+    collide = np.zeros(n, dtype=np.float64)
+    n_cut = 0
+
+    def detect(img):
+        try:
+            res = model.predict(_to_bgr_u8(img), conf=confidence, verbose=False)[0]
+            return res.boxes.xyxy.tolist() if len(res.boxes) else []
+        except Exception:
+            return []
+
+    for i in range(n):
+        ref_dets = detect(refined_crops[i])
+        if not ref_dets:
+            continue
+        src_dets = detect(source_crops[i])
+        fx, fy, fwd, fhd = (face_rects[i] if face_rects and i < len(face_rects) else (0.0, 0.0, 0.0, 0.0))
+        target = (fx, fy, fx + fwd, fy + fhd)
+        subj_src = max(src_dets, key=lambda d: _iou(d, target)) if src_dets else target
+        if src_dets and _iou(subj_src, target) < 0.15:
+            subj_src = target
+        subj_ref = max(ref_dets, key=lambda d: _iou(d, subj_src))
+        if _iou(subj_ref, subj_src) < 0.45:
+            collide[i] = 1.0                            # head rewritten / another person on top
+            continue
+        for det in ref_dets:
+            if det is subj_ref:
+                continue
+            twin = max((_iou(det, d) for d in src_dets if d is not subj_src), default=0.0)
+            dcx, dcy = (det[0] + det[2]) / 2.0, (det[1] + det[3]) / 2.0
+            inside = subj_src[0] <= dcx <= subj_src[2] and subj_src[1] <= dcy <= subj_src[3]
+            if twin < 0.3 and (inside or _iou(det, subj_src) > 0.1):
+                collide[i] = 1.0                        # hallucinated face over the subject
+                break
+            gx, gy = (det[2] - det[0]) * 0.2, (det[3] - det[1]) * 0.2
+            cuts[i].append((det[0] - gx, det[1] - gy, det[2] + gx, det[3] + gy))
+            n_cut += 1
+    if collide.any():
+        soft = np.maximum(collide, np.clip(_smooth(collide, 9, "gaussian") * 1.5, 0.0, 1.0))
+        weight = 1.0 - soft
+    else:
+        weight = np.ones(n)
+    return cuts, weight, n_cut, int(collide.sum())
+
+
+def _apply_cuts(mask_can, cuts, first_index, feather):
+    """Remove the given canvas boxes (feathered) from a chunk of paste masks."""
+    n, _, ch, cw = mask_can.shape
+    for j in range(n):
+        boxes = cuts[first_index + j] if first_index + j < len(cuts) else []
+        if not boxes:
+            continue
+        cut = torch.zeros((1, 1, ch, cw), device=mask_can.device, dtype=torch.float32)
+        for (x0, y0, x1, y1) in boxes:
+            x0, y0 = int(max(0, x0)), int(max(0, y0))
+            x1, y1 = int(min(cw, x1)), int(min(ch, y1))
+            if x1 > x0 and y1 > y0:
+                cut[0, 0, y0:y1, x0:x1] = 1.0
+        cut = _gaussian_blur_mask(cut, max(2, int(feather) // 2)).clamp(0, 1)
+        mask_can[j:j + 1] = mask_can[j:j + 1] * (1.0 - cut)
+    return mask_can
+
+
 def _feather_mask(h, w, feather, device, dtype):
     m = torch.ones((h, w), device=device, dtype=dtype)
     f = int(max(0, min(feather, min(h, w) // 2 - 1)))
@@ -490,6 +567,92 @@ def _feather_mask(h, w, feather, device, dtype):
     m[:, :f] *= ramp.view(1, -1)
     m[:, w - f:] *= ramp.flip(0).view(1, -1)
     return m
+
+
+def _parse_face_selection(text):
+    """'1' -> ranks [1]; '1,3' / '1 3' / '1;3' -> [1, 3]; 'all' / 'ALL' -> every face.
+
+    Returns (want_all, ranks). Whitespace, separators, case and stray characters are
+    tolerated; duplicates and non-positive numbers are dropped; empty falls back to [1].
+    """
+    import re
+
+    raw = str(text if text is not None else "1")
+    if re.search(r"\ball\b", raw, re.IGNORECASE):
+        return True, []
+    ranks = []
+    for token in re.findall(r"\d+", raw):
+        value = int(token)
+        if value >= 1 and value not in ranks:
+            ranks.append(value)
+    return False, ranks or [1]
+
+
+def _multi_face_tracks(frame_boxes, frames, width, height, max_gap=48):
+    """Track every detected face through the clip and rank the tracks 1 = biggest.
+
+    Greedy continuity matching (nearest box to a track's last position, penalised for size
+    change; a track survives up to `max_gap` missed frames). Tracks seen in fewer than
+    max(3, 2%) frames are dropped as false positives. Rank = average detected face height,
+    ties broken by how long the face is on screen.
+    """
+    tracks = []
+
+    def assign(track, i, box):
+        track["cx"][i] = (box[0] + box[2]) / 2.0
+        track["cy"][i] = (box[1] + box[3]) / 2.0
+        track["sz"][i] = box[3] - box[1]
+        track["fw"][i] = box[2] - box[0]
+        track["valid"][i] = True
+        track["last"] = (track["cx"][i], track["cy"][i], track["sz"][i])
+        track["last_i"] = i
+
+    for i, boxes in enumerate(frame_boxes):
+        active = [t for t in tracks if i - t["last_i"] <= max_gap]
+        pairs = []
+        for ti, t in enumerate(active):
+            gate = max(2.5 * t["last"][2], 0.05 * max(width, height))
+            for bi, box in enumerate(boxes):
+                cost = _continuity_cost(box, t["last"])
+                if cost < gate:
+                    pairs.append((cost, ti, bi))
+        pairs.sort()
+        used_t, used_b = set(), set()
+        for cost, ti, bi in pairs:
+            if ti in used_t or bi in used_b:
+                continue
+            used_t.add(ti); used_b.add(bi)
+            assign(active[ti], i, boxes[bi])
+        for bi, box in enumerate(boxes):
+            if bi not in used_b:
+                track = {k: np.zeros(frames) for k in ("cx", "cy", "sz", "fw")}
+                track["valid"] = np.zeros(frames, dtype=bool)
+                track["via_body"] = np.zeros(frames, dtype=bool)
+                assign(track, i, box)
+                tracks.append(track)
+
+    min_frames = max(3, int(round(0.02 * frames)))
+    tracks = [t for t in tracks if int(t["valid"].sum()) >= min_frames] or tracks
+    for t in tracks:
+        t["mean_height"] = float(t["sz"][t["valid"]].mean()) if t["valid"].any() else 0.0
+    tracks.sort(key=lambda t: (-t["mean_height"], -int(t["valid"].sum())))
+    return tracks
+
+
+def _draw_rank_tag(frame, x, y, rank, color):
+    """Stamp a small '#rank' tag (track colour) just above a preview box. frame: [H,W,3] float."""
+    try:
+        import cv2
+    except ImportError:
+        return
+    H, W = frame.shape[:2]
+    h, w = 22, 16 + 11 * len(str(rank))
+    x0 = int(min(max(x, 0), max(0, W - w)))
+    y0 = int(min(max(y - h, 0), max(0, H - h)))
+    tag = np.empty((h, w, 3), dtype=np.uint8)
+    tag[:] = np.asarray([c * 255.0 for c in color], dtype=np.uint8)
+    cv2.putText(tag, f"#{rank}", (3, h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    frame[y0:y0 + h, x0:x0 + w, :3] = torch.from_numpy(tag.astype(np.float32) / 255.0).to(frame.dtype)
 
 
 # ----------------------------------------------------------------------------
@@ -649,11 +812,27 @@ class MiniMaxH3FaceTrackCrop:
                     "tooltip": "Used only on frames where the FACE detector finds nothing (subject turned away). "
                                "A person/body model estimates the head from the body box; 'none' interpolates instead."}),
                 "fallback_head_frac": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.5, "step": 0.05}),
+                "faces": ("STRING", {"default": "1",
+                    "tooltip": "Which face(s) to refine. Faces are ranked by size: 1 = the biggest face in the clip, "
+                               "2 = the second biggest, ... (rank = average detected face height across the whole clip; "
+                               "ties go to the face that is on screen longer).\n"
+                               "'1' (default) = the main subject, exactly as before.  '2' = only the second biggest face.  "
+                               "'1,3' = faces 1 and 3.  'all' = every detected face.\n"
+                               "Spaces, ';' and upper/lower case do not matter (' 1, 3 ', 'ALL', 'All'). Unknown text is "
+                               "ignored; a rank that does not exist in the clip is skipped with a log message.\n"
+                               "Every selected face is one more full crop video in the refinement batch, so VRAM and time "
+                               "scale with the number of faces. The tracking preview tags each selected face with its rank "
+                               "(#1 green, #2 cyan, #3 yellow, ...). With anything other than '1', identity_reference, "
+                               "select, face_tracking and the body fallback are not used: every face is tracked by continuity."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE", "H3FACEXFORM", "IMAGE", "STRING", "INT", "INT")
     RETURN_NAMES = ("crops", "transform", "preview", "report", "canvas_w", "canvas_h")
+    # crops / transform are emitted as ONE ITEM PER SELECTED FACE. ComfyUI then runs the
+    # downstream nodes (inject, audio lock, sampler, decode) once per face, sequentially -
+    # H3 only samples batch size 1 - and the stitch node collects all faces (INPUT_IS_LIST).
+    OUTPUT_IS_LIST = (True, True, False, False, False, False)
     FUNCTION = "run"
     CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
     TITLE = "MiniMax H3 Face Track + Crop"
@@ -663,27 +842,29 @@ class MiniMaxH3FaceTrackCrop:
     def run(self, images, detector, confidence, crop_factor, canvas_mode, canvas_width,
             canvas_height, face_tracking, smooth_window, size_smooth_window, smooth_method,
             size_mode, identity_reference=None, identity_threshold=0.28, select="largest",
-            fallback_detector="none", fallback_head_frac=0.5):
+            fallback_detector="none", fallback_head_frac=0.5, faces="1"):
         model = _load_detector(detector)
         B, H, W, _ = images.shape
-
         cx = np.zeros(B); cy = np.zeros(B); sz = np.zeros(B); fw = np.zeros(B)
         valid = np.zeros(B, dtype=bool)       # a real FACE was seen
         via_body = np.zeros(B, dtype=bool)    # head located from a body box instead
+        frame_boxes = []                      # every detection per frame (multi-face ranking)
+        want_all, want_ranks = _parse_face_selection(faces)
+        multi = want_all or want_ranks != [1]
 
         import comfy.model_management as _mm
 
         # ---- identity anchor -------------------------------------------------------
         ref_emb, app = None, None
         n_ident, n_cont, n_conflict = 0, 0, 0
-        multi = False
+        many = False
         try:
             probe = model.predict(_to_bgr_u8(images[0]), conf=confidence, verbose=False)[0]
-            multi = len(probe.boxes) > 1
+            many = len(probe.boxes) > 1
         except Exception:
             pass
 
-        if face_tracking and (multi or identity_reference is not None):
+        if not multi and face_tracking and (many or identity_reference is not None):
             try:
                 app = _face_recogniser()
                 if identity_reference is not None:
@@ -708,6 +889,7 @@ class MiniMaxH3FaceTrackCrop:
             frame_bgr = _to_bgr_u8(images[i])
             res = model.predict(frame_bgr, conf=confidence, verbose=False)[0]
             boxes = res.boxes.xyxy.tolist() if len(res.boxes) else []
+            frame_boxes.append(boxes)
             if not boxes:
                 continue
 
@@ -764,6 +946,33 @@ class MiniMaxH3FaceTrackCrop:
                 "disable face inpainting for this clip."
             )
 
+        if multi:
+            # Every face is tracked through the clip and ranked 1 = biggest by average
+            # detected height (ties: longer on screen); "faces" picks the ranks to refine.
+            tracks = _multi_face_tracks(frame_boxes, B, W, H)
+            ranking = "  ".join(
+                f"#{r + 1}: {t['mean_height']:.0f}px x{int(t['valid'].sum())}f"
+                for r, t in enumerate(tracks))
+            wanted = list(range(1, len(tracks) + 1)) if want_all else want_ranks
+            chosen = [r for r in wanted if 1 <= r <= len(tracks)]
+            missing = [r for r in wanted if r not in chosen]
+            if missing:
+                print(f"[MiniMaxH3Face] faces={faces!r}: face(s) {missing} not found "
+                      f"({len(tracks)} face track(s) in the clip: {ranking}) - skipped")
+            if not chosen:
+                raise ValueError(
+                    f"Face inpaint: faces={faces!r} requested face(s) {wanted} but only "
+                    f"{len(tracks)} face track(s) exist in this clip ({ranking}). Faces are "
+                    "ranked 1 = biggest by average detected size; use '1', a valid list, or 'all'.")
+            selected = [tracks[r - 1] for r in chosen]
+            for t, r in zip(selected, chosen):
+                t["rank"] = r
+            head = (f"tracking: {len(tracks)} face track(s), ranked by average height ({ranking})\n"
+                    f"faces={faces!r} -> refining {[t['rank'] for t in selected]}")
+            return self._finish(images, selected, crop_factor, canvas_mode, canvas_width,
+                                canvas_height, smooth_window, size_smooth_window, smooth_method,
+                                size_mode, head, detector, confidence)
+
         sz_seed = _interp_gaps(sz, valid)
         if fallback_detector != "none" and (~valid).any():
             try:
@@ -784,27 +993,41 @@ class MiniMaxH3FaceTrackCrop:
             except Exception as exc:  # never let the fallback kill the run
                 print(f"[MiniMaxH3Face] body fallback '{fallback_detector}' failed: {exc}")
 
-        known = valid | via_body
-        raw_cx = _interp_gaps(cx, known)
-        raw_cy = _interp_gaps(cy, known)
-        raw_sz = _interp_gaps(sz, valid)   # size ALWAYS from real face measurements
-        raw_fw = _interp_gaps(fw, valid)
-        sm_fw = _smooth(raw_fw, size_smooth_window, smooth_method)
-        cx = _smooth(raw_cx, smooth_window, smooth_method)
-        cy = _smooth(raw_cy, smooth_window, smooth_method)
-        sz = _smooth(raw_sz, size_smooth_window, smooth_method)
-        if size_mode == "max_of_clip":
-            sz[:] = sz.max()
+        head = (f"tracking: {n_cont} by continuity, {n_conflict} ambiguous "
+                f"({n_ident} resolved by face identity)")
+        track = {"cx": cx, "cy": cy, "sz": sz, "fw": fw, "valid": valid, "via_body": via_body, "rank": 1}
+        return self._finish(images, [track], crop_factor, canvas_mode, canvas_width, canvas_height,
+                            smooth_window, size_smooth_window, smooth_method, size_mode, head,
+                            detector, confidence)
 
-        def _jit(a):
-            return float(np.abs(np.diff(a)).mean()) if len(a) > 1 else 0.0
+    def _finish(self, images, tracks, crop_factor, canvas_mode, canvas_width, canvas_height,
+                smooth_window, size_smooth_window, smooth_method, size_mode, head,
+                detector=None, confidence=0.35):
+        """Smooth each track, size ONE canvas for all of them, crop, and build the transforms."""
+        B, H, W, _ = images.shape
+        for t in tracks:
+            valid, via_body = t["valid"], t["via_body"]
+            known = valid | via_body
+            raw_cx = _interp_gaps(t["cx"], known)
+            raw_cy = _interp_gaps(t["cy"], known)
+            raw_sz = _interp_gaps(t["sz"], valid)   # size ALWAYS from real face measurements
+            raw_fw = _interp_gaps(t["fw"], valid)
+            t["sm_fw"] = _smooth(raw_fw, size_smooth_window, smooth_method)
+            t["cx"] = _smooth(raw_cx, smooth_window, smooth_method)
+            t["cy"] = _smooth(raw_cy, smooth_window, smooth_method)
+            t["sz"] = _smooth(raw_sz, size_smooth_window, smooth_method)
+            if size_mode == "max_of_clip":
+                t["sz"][:] = t["sz"].max()
+            t["known"] = known
 
-        jit_before = (_jit(raw_cx) + _jit(raw_cy)) / 2.0
-        jit_after = (_jit(cx) + _jit(cy)) / 2.0
-        sz_before, sz_after = _jit(raw_sz), _jit(sz)
+            def _jit(a):
+                return float(np.abs(np.diff(a)).mean()) if len(a) > 1 else 0.0
+
+            t["jit"] = ((_jit(raw_cx) + _jit(raw_cy)) / 2.0, (_jit(t["cx"]) + _jit(t["cy"])) / 2.0,
+                        _jit(raw_sz), _jit(t["sz"]))
 
         if canvas_mode != "manual":
-            need = float(min(sz.max() * crop_factor, H))
+            need = float(min(max(t["sz"].max() for t in tracks) * crop_factor, H))
             snapped = int(np.ceil(need / 32.0) * 32)
             if canvas_mode == "auto_capped_768":
                 snapped = min(snapped, 768)
@@ -819,116 +1042,135 @@ class MiniMaxH3FaceTrackCrop:
             canvas_width = canvas_height = snapped
 
         aspect = canvas_width / float(canvas_height)
-        boxes = []
-        crops = torch.zeros((B, canvas_height, canvas_width, 3), dtype=images.dtype)
         preview = images[..., :3].clone()
+        palette = [(0.0, 1.0, 0.0), (0.0, 1.0, 1.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0), (1.0, 0.5, 0.0)]
+        all_crops, transforms, reports = [], [], []
+        for k, t in enumerate(tracks):
+            cx, cy, sz, sm_fw, valid, via_body, known = (
+                t["cx"], t["cy"], t["sz"], t["sm_fw"], t["valid"], t["via_body"], t["known"])
+            boxes = []
+            crops = torch.zeros((B, canvas_height, canvas_width, 3), dtype=images.dtype)
+            for i in range(B):
+                bh = sz[i] * crop_factor
+                bw = bh * aspect
+                if bw > W:
+                    bw, bh = float(W), float(W) / aspect
+                if bh > H:
+                    bh, bw = float(H), float(H) * aspect
+                x = min(max(cx[i] - bw / 2.0, 0.0), max(0.0, W - bw))
+                y = min(max(cy[i] - bh / 2.0, 0.0), max(0.0, H - bh))
+                box = (float(x), float(y), float(bw), float(bh))
+                boxes.append(box)
 
-        for i in range(B):
-            bh = sz[i] * crop_factor
-            bw = bh * aspect
-            if bw > W:
-                bw, bh = float(W), float(W) / aspect
-            if bh > H:
-                bh, bw = float(H), float(H) * aspect
-            x = min(max(cx[i] - bw / 2.0, 0.0), max(0.0, W - bw))
-            y = min(max(cy[i] - bh / 2.0, 0.0), max(0.0, H - bh))
-            box = (float(x), float(y), float(bw), float(bh))
-            boxes.append(box)
+                crops[i: i + 1] = _affine_crop(
+                    images[i: i + 1], box, canvas_width, canvas_height
+                ).to(crops.dtype)
 
-            crops[i: i + 1] = _affine_crop(
-                images[i: i + 1], box, canvas_width, canvas_height
-            ).to(crops.dtype)
+                # preview: multi-face = colour per rank (green #1, cyan #2, yellow #3, ...);
+                # single-face = green real face, yellow body fallback, red interpolated
+                xi, yi = int(round(x)), int(round(y))
+                wi, hi = max(4, int(round(bw))), max(4, int(round(bh)))
+                xi = min(xi, W - wi); yi = min(yi, H - hi)
+                if len(tracks) > 1:
+                    r, g, bl = palette[k % len(palette)]
+                    if not valid[i]:
+                        r, g, bl = r * 0.5, g * 0.5, bl * 0.5
+                elif valid[i]:
+                    r, g, bl = 0.0, 1.0, 0.0
+                elif via_body[i]:
+                    r, g, bl = 1.0, 1.0, 0.0
+                else:
+                    r, g, bl = 1.0, 0.0, 0.0
+                for (yy0, yy1, xx0, xx1) in (
+                    (yi, yi + 2, xi, xi + wi), (yi + hi - 2, yi + hi, xi, xi + wi),
+                    (yi, yi + hi, xi, xi + 2), (yi, yi + hi, xi + wi - 2, xi + wi),
+                ):
+                    preview[i, yy0:yy1, xx0:xx1, 0] = r
+                    preview[i, yy0:yy1, xx0:xx1, 1] = g
+                    preview[i, yy0:yy1, xx0:xx1, 2] = bl
+                if len(tracks) > 1:
+                    _draw_rank_tag(preview[i], xi, yi, t["rank"], (r, g, bl))
 
-            # preview: green = real face, yellow = body fallback, red = interpolated
-            xi, yi = int(round(x)), int(round(y))
-            wi, hi = max(4, int(round(bw))), max(4, int(round(bh)))
-            xi = min(xi, W - wi); yi = min(yi, H - hi)
-            if valid[i]:
-                r, g = 0.0, 1.0
-            elif via_body[i]:
-                r, g = 1.0, 1.0
-            else:
-                r, g = 1.0, 0.0
-            for (yy0, yy1, xx0, xx1) in (
-                (yi, yi + 2, xi, xi + wi), (yi + hi - 2, yi + hi, xi, xi + wi),
-                (yi, yi + hi, xi, xi + 2), (yi, yi + hi, xi + wi - 2, xi + wi),
-            ):
-                preview[i, yy0:yy1, xx0:xx1, 0] = r
-                preview[i, yy0:yy1, xx0:xx1, 1] = g
-                preview[i, yy0:yy1, xx0:xx1, 2] = 0.0
+            weights = _smooth(valid.astype(np.float64), max(9, smooth_window // 2), "gaussian")
+            weights = np.clip(weights, 0.0, 1.0)
 
-        weights = _smooth(valid.astype(np.float64), max(9, smooth_window // 2), "gaussian")
-        weights = np.clip(weights, 0.0, 1.0)
+            runs, cur = [], 0
+            for v in known:
+                if v:
+                    if cur:
+                        runs.append(cur)
+                    cur = 0
+                else:
+                    cur += 1
+            if cur:
+                runs.append(cur)
+            longest_gap = max(runs) if runs else 0
 
-        runs, cur = [], 0
-        for v in known:
-            if v:
-                if cur:
-                    runs.append(cur)
-                cur = 0
-            else:
-                cur += 1
-        if cur:
-            runs.append(cur)
-        longest_gap = max(runs) if runs else 0
+            mags = [canvas_height / float(b[3]) for b in boxes]
+            transform = {
+                "boxes": boxes,
+                "canvas": (int(canvas_width), int(canvas_height)),
+                "src_size": (int(W), int(H)),
+                "frames": int(B),
+                "weights": [float(w) for w in weights],
+                "detected": [bool(v) for v in valid],
+                "face_rect": [
+                    (
+                        float(canvas_width) * 0.5 - 0.5 * float(sm_fw[i]) / max(b[2], 1e-6) * canvas_width,
+                        float(canvas_height) * 0.5 - 0.5 * float(sz[i]) / max(b[3], 1e-6) * canvas_height,
+                        float(sm_fw[i]) / max(b[2], 1e-6) * canvas_width,
+                        float(sz[i]) / max(b[3], 1e-6) * canvas_height,
+                    )
+                    for i, b in enumerate(boxes)
+                ],
+                "face_height_src": [float(v) for v in sz],
+                "crop_factor": float(crop_factor),
+                "rank": int(t["rank"]),
+                "detector": detector,
+                "confidence": float(confidence),
+            }
+            transforms.append(transform)
+            all_crops.append(crops)
 
-        mags = [canvas_height / float(b[3]) for b in boxes]
-        transform = {
-            "boxes": boxes,
-            "canvas": (int(canvas_width), int(canvas_height)),
-            "src_size": (int(W), int(H)),
-            "frames": int(B),
-            "weights": [float(w) for w in weights],
-            "detected": [bool(v) for v in valid],
-            "face_rect": [
-                (
-                    float(canvas_width) * 0.5 - 0.5 * float(sm_fw[i]) / max(b[2], 1e-6) * canvas_width,
-                    float(canvas_height) * 0.5 - 0.5 * float(sz[i]) / max(b[3], 1e-6) * canvas_height,
-                    float(sm_fw[i]) / max(b[2], 1e-6) * canvas_width,
-                    float(sz[i]) / max(b[3], 1e-6) * canvas_height,
+            gapwarn = ""
+            if longest_gap >= 12:
+                gapwarn = (
+                    f"\n!! longest dropout is {longest_gap} frames ({longest_gap / 24.0:.1f}s). The crop "
+                    f"box is interpolated across it and the composite fades out there."
                 )
-                for i, b in enumerate(boxes)
-            ],
-            "face_height_src": [float(v) for v in sz],
-            "crop_factor": float(crop_factor),
-        }
 
-        gapwarn = ""
-        if longest_gap >= 12:
-            gapwarn = (
-                f"\n!! longest dropout is {longest_gap} frames ({longest_gap / 24.0:.1f}s). The crop "
-                f"box is interpolated across it and the composite fades out there."
+            n_down = sum(1 for m in mags if m < 1.0)
+            warn = ""
+            if n_down:
+                need = max(b[3] for b in boxes)
+                warn = (
+                    f"\n!! {n_down}/{B} frames ({n_down / B * 100:.0f}%) have magnification < 1.0x - "
+                    f"their crops are DOWNSCALED into the canvas. Raise the canvas to >= {need:.0f}px, "
+                    f"lower crop_factor, or skip face inpainting on this close-up clip."
+                )
+
+            box_jit = float(np.mean([abs(boxes[i][0] - boxes[i - 1][0]) + abs(boxes[i][1] - boxes[i - 1][1])
+                                     for i in range(1, len(boxes))])) if len(boxes) > 1 else 0.0
+            jit_before, jit_after, sz_before, sz_after = t["jit"]
+            found = int(valid.sum())
+            label = f"[face #{t['rank']}] " if len(tracks) > 1 else ""
+            reports.append(
+                f"{label}frames={B}  face={found} ({found / B * 100:.0f}%)  "
+                f"body-fallback={int(via_body.sum())}  interpolated={B - int(known.sum())}\n"
+                f"{label}face height  min={sz.min():.0f}px  mean={sz.mean():.0f}px  max={sz.max():.0f}px\n"
+                f"{label}face fills   ~{100.0 / crop_factor:.0f}% of every crop (crop_factor={crop_factor})\n"
+                f"{label}magnification into {canvas_width}x{canvas_height}: "
+                f"min={min(mags):.2f}x  mean={sum(mags) / len(mags):.2f}x  max={max(mags):.2f}x\n"
+                f"{label}jitter ({smooth_method}) centre {jit_before:.2f} -> {jit_after:.2f} px/frame"
+                f"   size {sz_before:.2f} -> {sz_after:.2f} px/frame\n"
+                f"{label}box movement {box_jit:.2f} px/frame (sub-pixel float boxes)\n"
+                f"{label}dropout runs: {len(runs)}  longest={longest_gap} frames"
+                f"{gapwarn}{warn}"
             )
 
-        n_down = sum(1 for m in mags if m < 1.0)
-        warn = ""
-        if n_down:
-            need = max(b[3] for b in boxes)
-            warn = (
-                f"\n!! {n_down}/{B} frames ({n_down / B * 100:.0f}%) have magnification < 1.0x - "
-                f"their crops are DOWNSCALED into the canvas. Raise the canvas to >= {need:.0f}px, "
-                f"lower crop_factor, or skip face inpainting on this close-up clip."
-            )
-
-        box_jit = float(np.mean([abs(boxes[i][0] - boxes[i - 1][0]) + abs(boxes[i][1] - boxes[i - 1][1])
-                                 for i in range(1, len(boxes))])) if len(boxes) > 1 else 0.0
-        report = (
-            f"tracking: {n_cont} by continuity, {n_conflict} ambiguous "
-            f"({n_ident} resolved by face identity)\n"
-            f"frames={B}  face={found} ({found / B * 100:.0f}%)  "
-            f"body-fallback={int(via_body.sum())}  interpolated={B - int(known.sum())}\n"
-            f"face height  min={sz.min():.0f}px  mean={sz.mean():.0f}px  max={sz.max():.0f}px\n"
-            f"face fills   ~{100.0 / crop_factor:.0f}% of every crop (crop_factor={crop_factor})\n"
-            f"magnification into {canvas_width}x{canvas_height}: "
-            f"min={min(mags):.2f}x  mean={sum(mags) / len(mags):.2f}x  max={max(mags):.2f}x\n"
-            f"jitter ({smooth_method}) centre {jit_before:.2f} -> {jit_after:.2f} px/frame"
-            f"   size {sz_before:.2f} -> {sz_after:.2f} px/frame\n"
-            f"box movement {box_jit:.2f} px/frame (sub-pixel float boxes)\n"
-            f"dropout runs: {len(runs)}  longest={longest_gap} frames"
-            f"{gapwarn}{warn}"
-        )
+        report = head + "\n" + "\n".join(reports)
         print("[MiniMaxH3Face] " + report.replace("\n", "\n[MiniMaxH3Face] "))
-        return (crops, transform, preview, report, int(canvas_width), int(canvas_height))
+        return (all_crops, transforms, preview, report, int(canvas_width), int(canvas_height))
 
 
 # ----------------------------------------------------------------------------
@@ -1446,21 +1688,58 @@ class MiniMaxH3FaceStitch:
                                "measured at 0.55 denoise) while keeping the regenerated detail. Default ON."}),
                 "geometry_lock_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "1.0 follows the source geometry fully; lower values keep part of the regenerated pose."}),
+                "suppress_other_faces": ("BOOLEAN", {"default": True,
+                    "label_on": "GUARD: OTHER FACES STAY ORIGINAL", "label_off": "OFF",
+                    "tooltip": "Hallucination guard. The face detector compares every regenerated crop with its input crop: "
+                               "the same faces must be in the same places. A neighbour's face inside the crop is cut out of the "
+                               "paste (it keeps its original pixels), a face H3 invented beside the subject is cut out too, and "
+                               "frames where H3 rewrote the head (new pose/size) or painted a face over the subject are not "
+                               "pasted at all - they fade back to the original. face_only / face_ellipse pastes only."}),
             },
         }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
+    # receives every input as a list: one refined crop batch + one transform per selected face
+    INPUT_IS_LIST = True
     FUNCTION = "run"
     CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
     TITLE = "MiniMax H3 Face Stitch Back"
     DESCRIPTION = "Composite H3-refined face crops back into the source frames (with optional geometry lock)."
 
     def run(self, base_images, refined_crops, transform, paste_region, mask_dilation, feather,
-            colour_match, blend, undetected_frames="fade_out", masks=None,
-            feather_scales_with_crop=False, size_aware_blend=True,
-            full_refine_face_px=60.0, passthrough_face_px=180.0,
-            geometry_lock=True, geometry_lock_strength=1.0):
+            colour_match, blend, undetected_frames=("fade_out",), masks=(None,),
+            feather_scales_with_crop=(False,), size_aware_blend=(True,),
+            full_refine_face_px=(60.0,), passthrough_face_px=(180.0,),
+            geometry_lock=(True,), geometry_lock_strength=(1.0,), suppress_other_faces=(True,)):
+        # INPUT_IS_LIST: every argument arrives as a list. Widgets carry one value; refined_crops
+        # and transform hold one entry per selected face (the tracker emits them per face and the
+        # sampler / decoder ran once per face). The faces are composited one after another.
+        pick = lambda v: v[0] if isinstance(v, (list, tuple)) else v
+        out = pick(base_images)
+        transforms = list(transform) if isinstance(transform, (list, tuple)) else [transform]
+        crops_list = list(refined_crops) if isinstance(refined_crops, (list, tuple)) else [refined_crops]
+        if len(crops_list) != len(transforms):
+            raise ValueError(f"Face stitch received {len(crops_list)} refined crop batches for "
+                             f"{len(transforms)} face transforms.")
+        mask_list = list(masks) if isinstance(masks, (list, tuple)) else [masks]
+        for k, face_transform in enumerate(transforms):
+            if len(transforms) > 1:
+                print(f"[MiniMaxH3Face] stitching face #{face_transform.get('rank', k + 1)} "
+                      f"({k + 1}/{len(transforms)})")
+            (out,) = self._stitch(
+                out, crops_list[k], face_transform, pick(paste_region), pick(mask_dilation),
+                pick(feather), pick(colour_match), pick(blend), pick(undetected_frames),
+                mask_list[k] if k < len(mask_list) else mask_list[0],
+                pick(feather_scales_with_crop), pick(size_aware_blend), pick(full_refine_face_px),
+                pick(passthrough_face_px), pick(geometry_lock), pick(geometry_lock_strength),
+                pick(suppress_other_faces))
+        return (out,)
+
+    def _stitch(self, base_images, refined_crops, transform, paste_region, mask_dilation, feather,
+                colour_match, blend, undetected_frames, masks, feather_scales_with_crop,
+                size_aware_blend, full_refine_face_px, passthrough_face_px,
+                geometry_lock, geometry_lock_strength, suppress_other_faces=True):
         boxes = transform["boxes"]
         if undetected_frames == "composite_anyway":
             weights = None
@@ -1503,6 +1782,20 @@ class MiniMaxH3FaceStitch:
 
         per_frame_mb = (H * W * 3 * 4) / 2 ** 20
         chunk = max(1, min(32, int(1024 / max(per_frame_mb, 1e-6))))
+        guard_cuts, guard_w = None, None
+        if suppress_other_faces and masks is None and paste_region != "full_crop" and transform.get("detector"):
+            try:
+                source_crops = torch.cat([
+                    _affine_crop(base_images[i: i + 1].to(dev), boxes[i], cw, ch).cpu() for i in range(B)], dim=0)
+                guard_cuts, guard_w, n_cut, n_collide = _scan_other_faces(
+                    _load_detector(transform["detector"]), source_crops, refined_crops[:B], face_rects,
+                    float(transform.get("confidence", 0.35)))
+                del source_crops
+                print(f"[MiniMaxH3Face] other-face guard: {n_cut} neighbour/foreign face(s) cut from the paste, "
+                      f"{n_collide} frame(s) where H3 rewrote the head or painted a face over it "
+                      f"-> {'kept original there' if n_collide else 'none'}")
+            except Exception as exc:
+                print(f"[MiniMaxH3Face] other-face guard unavailable ({exc}); pasting without it")
         lock = bool(geometry_lock) and float(geometry_lock_strength) > 0.0
         if lock:
             try:
@@ -1549,6 +1842,8 @@ class MiniMaxH3FaceStitch:
                         "ellipse" if paste_region == "face_ellipse" else "rect",
                         dev, torch.float32)
                     for i in range(c0, c1)], dim=0)
+                if guard_cuts is not None:
+                    mask_can = _apply_cuts(mask_can, guard_cuts, c0, f_can)
 
             th = torch.empty((n, 2, 3), dtype=torch.float32, device=dev)
             for j, i in enumerate(range(c0, c1)):
@@ -1595,6 +1890,10 @@ class MiniMaxH3FaceStitch:
                 for j, i in enumerate(range(c0, c1)):
                     if i < len(size_weights):
                         wv[j] *= float(size_weights[i])
+            if guard_w is not None:
+                for j, i in enumerate(range(c0, c1)):
+                    if i < len(guard_w):
+                        wv[j] *= float(guard_w[i])
             mm_ = m * wv
 
             out[c0:c1] = ((1.0 - mm_) * base + mm_ * patch).to(out.device, dt)
@@ -1846,7 +2145,8 @@ class MiniMaxH3FaceTransformInfo:
     def run(self, transform, max_rows):
         boxes = transform["boxes"]
         cw, ch = transform["canvas"]
-        lines = [f"frames={transform['frames']}  canvas={cw}x{ch}  src={transform['src_size']}",
+        lines = [f"face #{transform.get('rank', 1)}: frames={transform['frames']}  canvas={cw}x{ch}  "
+                 f"src={transform['src_size']}",
                  f"{'frame':>6} {'x':>6} {'y':>6} {'w':>6} {'h':>6} {'mag':>6}"]
         step = max(1, len(boxes) // max_rows)
         for i in range(0, len(boxes), step):
