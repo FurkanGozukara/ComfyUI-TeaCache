@@ -55,6 +55,65 @@ def _size_aware_stitch_weights(face_heights, full_refine_px, passthrough_px):
     smoothstep = t * t * (3.0 - 2.0 * t)
     return 1.0 - smoothstep
 
+
+def _warp_similarity_batch(images: torch.Tensor, matrices: np.ndarray) -> torch.Tensor:
+    """Warp images with source-to-destination pixel transforms using grid_sample."""
+    import torch.nn.functional as F
+
+    if images.ndim != 4 or images.shape[-1] < 3:
+        raise ValueError("Expected IMAGE data shaped [B,H,W,C].")
+    count, height, width = images.shape[:3]
+    if len(matrices) != count:
+        raise ValueError(f"Expected {count} alignment matrices, received {len(matrices)}.")
+
+    pixel_from_norm = np.asarray([
+        [width * 0.5, 0.0, (width - 1.0) * 0.5],
+        [0.0, height * 0.5, (height - 1.0) * 0.5],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    norm_from_pixel = np.linalg.inv(pixel_from_norm)
+    theta = []
+    for matrix in matrices:
+        source_to_dest = np.eye(3, dtype=np.float64)
+        source_to_dest[:2] = np.asarray(matrix, dtype=np.float64)
+        dest_to_source = np.linalg.inv(source_to_dest)
+        theta.append((norm_from_pixel @ dest_to_source @ pixel_from_norm)[:2])
+
+    result = images.clone()
+    import comfy.model_management as mm
+    try:
+        device = mm.get_torch_device()
+    except Exception:
+        device = images.device
+    chunk = 8
+    for start in range(0, count, chunk):
+        mm.throw_exception_if_processing_interrupted()
+        end = min(start + chunk, count)
+        rgb = images[start:end, ..., :3].movedim(-1, 1).to(
+            device=device, dtype=torch.float32)
+        theta_t = torch.as_tensor(
+            np.stack(theta[start:end]), device=device, dtype=torch.float32)
+        grid = F.affine_grid(theta_t, rgb.shape, align_corners=False)
+        warped = F.grid_sample(
+            rgb, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        result[start:end, ..., :3] = warped.movedim(1, -1).to(
+            device=result.device, dtype=images.dtype)
+    return result
+
+
+def _face_alignment_comparison(original, refined, aligned, panel_size=256):
+    """Build a memory-bounded original/raw/aligned strip for visual QA."""
+    import torch.nn.functional as F
+
+    panels = []
+    for images in (original, refined, aligned):
+        rgb = images[..., :3].movedim(-1, 1).float()
+        if rgb.shape[-2:] != (panel_size, panel_size):
+            rgb = F.interpolate(
+                rgb, size=(panel_size, panel_size), mode="bilinear", align_corners=False)
+        panels.append(rgb.movedim(1, -1).to(images.dtype))
+    return torch.cat(panels, dim=2)
+
 # ----------------------------------------------------------------------------
 # detector helpers
 # ----------------------------------------------------------------------------
@@ -155,6 +214,48 @@ def _face_recogniser(pack: str = "buffalo_l"):
     app.prepare(ctx_id=0, det_size=(640, 640))
     _REC_CACHE[pack] = app
     return app
+
+
+def _face_landmark_detector(pack: str = "buffalo_l"):
+    """Load InsightFace detection plus its dense 2D landmark model."""
+    key = f"landmarks:{pack}"
+    if key in _REC_CACHE:
+        return _REC_CACHE[key]
+    import insightface
+
+    root = os.path.join(getattr(folder_paths, "models_dir", "models"), "insightface")
+    app = insightface.app.FaceAnalysis(
+        name=pack, root=root, allowed_modules=["detection", "landmark_2d_106"],
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    _REC_CACHE[key] = app
+    return app
+
+
+def _largest_central_landmarks(app, bgr):
+    """Return dense landmarks and detector confidence for the crop's primary face."""
+    faces = [
+        f for f in app.get(bgr)
+        if (getattr(f, "landmark_2d_106", None) is not None
+            or getattr(f, "kps", None) is not None)
+    ]
+    if not faces:
+        return None, 0.0
+    h, w = bgr.shape[:2]
+    center = np.asarray((w * 0.5, h * 0.5), dtype=np.float32)
+
+    def score(face):
+        x0, y0, x1, y1 = (float(v) for v in face.bbox)
+        area = max(x1 - x0, 0.0) * max(y1 - y0, 0.0)
+        fc = np.asarray(((x0 + x1) * 0.5, (y0 + y1) * 0.5), dtype=np.float32)
+        distance_penalty = float(np.linalg.norm(fc - center)) / max(w, h, 1)
+        return area * max(0.25, 1.0 - distance_penalty)
+
+    face = max(faces, key=score)
+    points = getattr(face, "landmark_2d_106", None)
+    if points is None:
+        points = face.kps
+    return np.asarray(points, dtype=np.float64), float(getattr(face, "det_score", 1.0))
 
 
 def _embed_faces(app, bgr):
@@ -374,7 +475,7 @@ class MiniMaxH3FacePromptEnhance:
         return (_append_face_refinement_prompt(prompt, refinement_prompt),)
 
 
-# These face-specific wrappers make the actual 0.60 pass denoise distinct from
+# These face-specific wrappers make the actual 0.55 pass denoise distinct from
 # the per-frame size multipliers and give the preset stable, explicit defaults.
 class MiniMaxH3FaceSamplerSelect:
     @classmethod
@@ -416,8 +517,8 @@ class MiniMaxH3FaceScheduler:
                 "model": ("MODEL",),
                 "scheduler": (schedulers,),
                 "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
-                "denoise": ("FLOAT", {"default": 0.60, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Actual face-pass denoise. Recommended: 0.60. Per-frame size multipliers scale this value."}),
+                "denoise": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Actual face-pass denoise. Preset default: 0.55. Optional size scaling multiplies this value."}),
             },
         }
 
@@ -426,7 +527,7 @@ class MiniMaxH3FaceScheduler:
     FUNCTION = "run"
     CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
     TITLE = "MiniMax H3 Face Scheduler"
-    DESCRIPTION = "Build the face-pass sigma schedule with an explicit 0.60 denoise default."
+    DESCRIPTION = "Build the face-pass sigma schedule with an explicit 0.55 denoise default."
 
     def run(self, model, scheduler, steps, denoise):
         import comfy.samplers
@@ -962,9 +1063,9 @@ class MiniMaxH3FacePerFrameDenoise:
                 "av_latent": ("LATENT",),
                 "transform": ("H3FACEXFORM",),
                 "strength_small_face": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "SIZE MULTIPLIER, not another denoise setting. 1.0 x the recommended 0.60 face pass = 0.60 effective denoise."}),
+                    "tooltip": "Scaling start multiplier for small faces. At 1.00, the 0.55 face pass remains 0.55."}),
                 "strength_large_face": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.05,
-                    "tooltip": "SIZE MULTIPLIER for large faces. 0.25 x the recommended 0.60 face pass = 0.15 effective denoise."}),
+                    "tooltip": "Scaling end multiplier for large faces. 0.25 x 0.55 gives about 0.14 effective denoise; 0.50 gives 0.275."}),
                 "scale_mode": (["absolute_px", "relative_to_clip"], {"default": "absolute_px"}),
                 "face_px_small": ("FLOAT", {"default": 60.0, "min": 4.0, "max": 400.0, "step": 1.0,
                     "tooltip": "Face height (source px) at or below which the full small-face strength applies."}),
@@ -973,17 +1074,22 @@ class MiniMaxH3FacePerFrameDenoise:
                 "gamma": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 4.0, "step": 0.1}),
                 "smooth_frames": ("INT", {"default": 9, "min": 1, "max": 61, "step": 2}),
             },
+            "optional": {
+                "enable_size_scaling": ("BOOLEAN", {"default": False,
+                    "tooltip": "OFF keeps a constant 1.00 multiplier. ON interpolates from the small-face multiplier to the large-face multiplier."}),
+            },
         }
 
     RETURN_TYPES = ("LATENT", "STRING")
     RETURN_NAMES = ("av_latent", "report")
     FUNCTION = "run"
     CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
-    TITLE = "MiniMax H3 Face Size Multipliers"
-    DESCRIPTION = "Multiply the face-pass denoise by face size: 1.0 for small faces, 0.25 for large faces."
+    TITLE = "MiniMax H3 Face Size Scaling"
+    DESCRIPTION = "Optionally scale denoise by face size. Disabled by default for a constant 0.55 face pass."
 
     def run(self, av_latent, transform, strength_small_face, strength_large_face,
-            scale_mode, face_px_small, face_px_large, gamma, smooth_frames):
+            scale_mode, face_px_small, face_px_large, gamma, smooth_frames,
+            enable_size_scaling=False):
         import torch.nn.functional as F
 
         samples = av_latent.get("samples")
@@ -1000,18 +1106,26 @@ class MiniMaxH3FacePerFrameDenoise:
         if face.size == 0:
             raise ValueError("transform has no boxes")
 
-        if scale_mode == "relative_to_clip":
-            lo, hi = float(face.min()), float(face.max())
+        if enable_size_scaling:
+            if scale_mode == "relative_to_clip":
+                lo, hi = float(face.min()), float(face.max())
+            else:
+                lo, hi = float(face_px_small), float(face_px_large)
+            if hi - lo < 1e-6:
+                t = np.zeros_like(face)
+            else:
+                t = np.clip((face - lo) / (hi - lo), 0.0, 1.0)
+            t = np.clip(t, 0.0, 1.0) ** float(gamma)
+            strength = strength_small_face + (strength_large_face - strength_small_face) * t
+            strength = _smooth(strength, int(smooth_frames), "gaussian")
+            strength = np.clip(strength, 0.0, 1.0)
+            mode_report = (
+                f"enabled, ramp {lo:.0f}-{hi:.0f}px ({scale_mode}), "
+                f"multipliers {float(strength_small_face):.2f}->{float(strength_large_face):.2f}"
+            )
         else:
-            lo, hi = float(face_px_small), float(face_px_large)
-        if hi - lo < 1e-6:
-            t = np.zeros_like(face)
-        else:
-            t = np.clip((face - lo) / (hi - lo), 0.0, 1.0)
-        t = np.clip(t, 0.0, 1.0) ** float(gamma)
-        strength = strength_small_face + (strength_large_face - strength_small_face) * t
-        strength = _smooth(strength, int(smooth_frames), "gaussian")
-        strength = np.clip(strength, 0.0, 1.0)
+            strength = np.ones_like(face, dtype=np.float64)
+            mode_report = "disabled, constant multiplier 1.00"
 
         s = torch.from_numpy(strength).float().view(1, 1, -1)
         s = F.interpolate(s, size=int(latent_t), mode="linear", align_corners=True)
@@ -1035,8 +1149,8 @@ class MiniMaxH3FacePerFrameDenoise:
         out = dict(av_latent)
         out["noise_mask"] = new_mask
         report = (
-            f"per-frame denoise: face {face.min():.0f}-{face.max():.0f}px, ramp "
-            f"{lo:.0f}-{hi:.0f}px ({scale_mode})  ->  strength "
+            f"per-frame denoise: face {face.min():.0f}-{face.max():.0f}px, size scaling "
+            f"{mode_report}  ->  strength "
             f"{strength.max():.2f} (smallest) .. {strength.min():.2f} (largest)\n"
             f"mean {strength.mean():.2f} over {len(strength)} frames, "
             f"{latent_t} latent steps, gamma={gamma}"
@@ -1046,7 +1160,191 @@ class MiniMaxH3FacePerFrameDenoise:
 
 
 # ----------------------------------------------------------------------------
-# 6. stitch back
+# 6. landmark alignment
+# ----------------------------------------------------------------------------
+
+
+class MiniMaxH3FaceLandmarkAlign:
+    """Align regenerated facial geometry to the corresponding input crop."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "original_crops": ("IMAGE",),
+                "refined_crops": ("IMAGE",),
+                "enabled": ("BOOLEAN", {"default": True,
+                    "label_on": "ALIGN LANDMARKS", "label_off": "BYPASS",
+                    "tooltip": "Correct small translation, scale, and head-roll changes before stitching."}),
+                "alignment_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "smooth_frames": ("INT", {"default": 7, "min": 1, "max": 31, "step": 2,
+                    "tooltip": "Smooth only the generated-to-original correction, not the real head motion."}),
+                "max_rotation_deg": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 15.0, "step": 0.25}),
+                "max_scale_change": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.30, "step": 0.01}),
+                "max_shift_ratio": ("FLOAT", {"default": 0.03, "min": 0.0, "max": 0.15, "step": 0.005,
+                    "tooltip": "Maximum face-center correction as a fraction of the crop size."}),
+                "min_confidence": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("aligned_crops", "comparison", "report")
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Landmark Align"
+    DESCRIPTION = "Match refined eyes, nose, and mouth to the original crop before compositing."
+
+    def run(self, original_crops, refined_crops, enabled, alignment_strength, smooth_frames,
+            max_rotation_deg, max_scale_change, max_shift_ratio, min_confidence):
+        if original_crops.shape[1:3] != refined_crops.shape[1:3]:
+            raise ValueError(
+                "Landmark alignment requires original and refined crops at the same resolution.")
+        count = min(original_crops.shape[0], refined_crops.shape[0])
+        if count <= 0:
+            raise ValueError("Landmark alignment received no frames.")
+        original = original_crops[:count, ..., :3]
+        refined = refined_crops[:count, ..., :3]
+        if not enabled or float(alignment_strength) <= 0.0:
+            comparison = _face_alignment_comparison(original, refined, refined)
+            return (refined_crops, comparison, "landmark alignment bypassed")
+
+        try:
+            import cv2
+            app = _face_landmark_detector("buffalo_l")
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not load InsightFace buffalo_l for landmark alignment. Its first use "
+                "downloads into ComfyUI/models/insightface/models/buffalo_l. "
+                f"Original error: {exc}") from exc
+
+        import comfy.model_management as mm
+        try:
+            import comfy.utils
+            progress = comfy.utils.ProgressBar(count * 2)
+        except Exception:
+            progress = None
+
+        angles = np.zeros(count, dtype=np.float64)
+        log_scales = np.zeros(count, dtype=np.float64)
+        shifts_x = np.zeros(count, dtype=np.float64)
+        shifts_y = np.zeros(count, dtype=np.float64)
+        source_centers = np.tile(
+            np.asarray((refined.shape[2] * 0.5, refined.shape[1] * 0.5)), (count, 1))
+        valid = np.zeros(count, dtype=bool)
+        rejected = 0
+        inlier_counts = []
+        max_shift_px = float(max_shift_ratio) * float(min(refined.shape[1:3]))
+
+        for index in range(count):
+            mm.throw_exception_if_processing_interrupted()
+            source_points, source_score = _largest_central_landmarks(
+                app, _to_bgr_u8(refined[index]))
+            if progress is not None:
+                progress.update(1)
+            target_points, target_score = _largest_central_landmarks(
+                app, _to_bgr_u8(original[index]))
+            if progress is not None:
+                progress.update(1)
+            if (source_points is None or target_points is None
+                    or min(source_score, target_score) < float(min_confidence)):
+                continue
+
+            matrix, inliers = cv2.estimateAffinePartial2D(
+                source_points, target_points, method=cv2.RANSAC,
+                ransacReprojThreshold=max(1.5, refined.shape[1] * 0.003),
+                maxIters=2000, confidence=0.995, refineIters=10)
+            if matrix is None:
+                continue
+            inlier_count = int(inliers.sum()) if inliers is not None else len(source_points)
+            if inlier_count < 3:
+                continue
+
+            a, b = float(matrix[0, 0]), float(matrix[1, 0])
+            scale = float(np.hypot(a, b))
+            angle = float(np.degrees(np.arctan2(b, a)))
+            source_center = source_points.mean(axis=0)
+            target_center = target_points.mean(axis=0)
+            shift = target_center - source_center
+
+            gross_rotation = max(15.0, float(max_rotation_deg) * 4.0)
+            gross_scale = max(0.25, float(max_scale_change) * 4.0)
+            gross_shift = max(24.0, max_shift_px * 4.0)
+            if (abs(angle) > gross_rotation or abs(scale - 1.0) > gross_scale
+                    or float(np.linalg.norm(shift)) > gross_shift):
+                rejected += 1
+                continue
+
+            clipped_angle = float(np.clip(angle, -max_rotation_deg, max_rotation_deg))
+            clipped_scale = float(np.clip(
+                scale, 1.0 - max_scale_change, 1.0 + max_scale_change))
+            shift_norm = float(np.linalg.norm(shift))
+            if max_shift_px >= 0.0 and shift_norm > max_shift_px > 0.0:
+                shift *= max_shift_px / shift_norm
+            angles[index] = clipped_angle
+            log_scales[index] = np.log(max(clipped_scale, 1e-6))
+            shifts_x[index], shifts_y[index] = float(shift[0]), float(shift[1])
+            source_centers[index] = source_center
+            valid[index] = True
+            inlier_counts.append(inlier_count)
+
+        found = int(valid.sum())
+        if found == 0:
+            comparison = _face_alignment_comparison(original, refined, refined)
+            report = (
+                "landmark alignment: no reliable landmark pairs; returned refined crops unchanged")
+            print("[MiniMaxH3Face] " + report)
+            return (refined_crops, comparison, report)
+
+        def fill_and_smooth(values):
+            filled = _interp_gaps(values, valid)
+            return _smooth(filled, int(smooth_frames), "gaussian")
+
+        angles = np.clip(
+            fill_and_smooth(angles), -float(max_rotation_deg), float(max_rotation_deg))
+        log_limit_low = np.log(max(1.0 - float(max_scale_change), 1e-6))
+        log_limit_high = np.log(1.0 + float(max_scale_change))
+        log_scales = np.clip(fill_and_smooth(log_scales), log_limit_low, log_limit_high)
+        shifts_x = fill_and_smooth(shifts_x)
+        shifts_y = fill_and_smooth(shifts_y)
+        for values in (source_centers[:, 0], source_centers[:, 1]):
+            values[:] = _interp_gaps(values, valid)
+
+        strength = float(alignment_strength)
+        matrices = []
+        applied_angles = angles * strength
+        applied_scales = np.exp(log_scales * strength)
+        applied_x = shifts_x * strength
+        applied_y = shifts_y * strength
+        for index in range(count):
+            radians = np.radians(applied_angles[index])
+            cosine, sine = np.cos(radians), np.sin(radians)
+            scale = applied_scales[index]
+            linear = scale * np.asarray(((cosine, -sine), (sine, cosine)))
+            center = source_centers[index]
+            destination_center = center + np.asarray((applied_x[index], applied_y[index]))
+            translation = destination_center - linear @ center
+            matrices.append(np.column_stack((linear, translation)))
+
+        aligned = _warp_similarity_batch(refined, np.stack(matrices))
+        if refined_crops.shape[0] > count:
+            aligned = torch.cat((aligned, refined_crops[count:]), dim=0)
+        comparison = _face_alignment_comparison(
+            original, refined, aligned[:count, ..., :3])
+        report = (
+            f"landmark alignment: {found}/{count} measured, {count - found} interpolated, "
+            f"{rejected} rejected; median correction rotation={np.median(applied_angles):+.3f}deg "
+            f"scale={np.median(applied_scales):.4f} "
+            f"shift=({np.median(applied_x):+.2f},{np.median(applied_y):+.2f})px; "
+            f"max |rotation|={np.max(np.abs(applied_angles)):.3f}deg "
+            f"max shift={np.max(np.hypot(applied_x, applied_y)):.2f}px "
+            f"median inliers={np.median(inlier_counts):.0f}"
+        )
+        print("[MiniMaxH3Face] " + report)
+        return (aligned, comparison, report)
+
+
+# ----------------------------------------------------------------------------
+# 7. stitch back
 # ----------------------------------------------------------------------------
 
 
@@ -1233,7 +1531,224 @@ class MiniMaxH3FaceStitch:
 
 
 # ----------------------------------------------------------------------------
-# 7. debug info
+# 8. stitch option comparison
+# ----------------------------------------------------------------------------
+
+
+class MiniMaxH3FaceStitchOptionsComparison:
+    """Render a controlled face-only/full-crop and size-aware on/off comparison."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "original_crops": ("IMAGE",),
+            "refined_crops": ("IMAGE",),
+            "transform": ("H3FACEXFORM",),
+            "mask_dilation": ("INT", {"default": 24, "min": 0, "max": 256, "step": 2}),
+            "feather": ("INT", {"default": 16, "min": 0, "max": 256, "step": 2}),
+            "colour_match": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "blend": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "feather_scales_with_crop": ("BOOLEAN", {"default": False}),
+            "full_refine_face_px": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 1024.0, "step": 1.0}),
+            "passthrough_face_px": ("FLOAT", {"default": 180.0, "min": 1.0, "max": 2048.0, "step": 1.0}),
+            "panel_size": ("INT", {"default": 256, "min": 128, "max": 512, "step": 64}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("comparison", "report")
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Stitch Options Comparison"
+    DESCRIPTION = "Compare face-only/full-crop and size-aware blend on/off using the same raw refinement."
+
+    @staticmethod
+    def _colour_match(base, patch, mask, strength):
+        if strength <= 0.0:
+            return patch
+        wsum = mask.sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        bmu = (base * mask).sum(dim=(1, 2), keepdim=True) / wsum
+        pmu = (patch * mask).sum(dim=(1, 2), keepdim=True) / wsum
+        bsd = (((base - bmu) ** 2 * mask).sum(dim=(1, 2), keepdim=True)
+               / wsum).sqrt().clamp_min(1e-6)
+        psd = (((patch - pmu) ** 2 * mask).sum(dim=(1, 2), keepdim=True)
+               / wsum).sqrt().clamp_min(1e-6)
+        adjusted = (patch - pmu) * (bsd / psd) + bmu
+        return (patch + (adjusted - patch) * float(strength)).clamp(0, 1)
+
+    def run(self, original_crops, refined_crops, transform, mask_dilation, feather,
+            colour_match, blend, feather_scales_with_crop, full_refine_face_px,
+            passthrough_face_px, panel_size):
+        import comfy.model_management as mm
+        import torch.nn.functional as F
+
+        boxes = transform["boxes"]
+        face_rects = transform.get("face_rect") or []
+        tracked_weights = transform.get("weights")
+        B = min(original_crops.shape[0], refined_crops.shape[0], len(boxes))
+        if B <= 0:
+            raise ValueError("No crop frames are available for stitch comparison")
+
+        cw, ch = transform["canvas"]
+        if original_crops.shape[1:3] != (ch, cw):
+            raise ValueError(
+                f"Original crop size {tuple(original_crops.shape[1:3])} does not match "
+                f"transform canvas {(ch, cw)}")
+
+        face_heights = _face_heights_from_transform(transform)[:B]
+        size_weights = _size_aware_stitch_weights(
+            face_heights, full_refine_face_px, passthrough_face_px)
+
+        try:
+            dev = mm.get_torch_device()
+        except Exception:
+            dev = original_crops.device
+
+        panel = int(panel_size)
+        output = torch.empty((B, panel * 2, panel * 4, 3), dtype=torch.float32)
+        chunk = 4
+
+        for c0 in range(0, B, chunk):
+            mm.throw_exception_if_processing_interrupted()
+            c1 = min(c0 + chunk, B)
+            n = c1 - c0
+            base = original_crops[c0:c1, ..., :3].to(dev).float()
+            raw = refined_crops[c0:c1, ..., :3].to(dev).float()
+
+            face_masks = []
+            full_masks = []
+            for i in range(c0, c1):
+                if feather_scales_with_crop:
+                    f_can = int(feather)
+                else:
+                    bh = float(boxes[i][3])
+                    f_can = int(round(float(feather) * (ch / max(bh, 1.0))))
+                    f_can = max(1, min(f_can, ch // 3))
+
+                face_rect = (face_rects[i] if i < len(face_rects)
+                             else (cw * 0.25, ch * 0.25, cw * 0.5, ch * 0.5))
+                face_masks.append(_face_region_mask(
+                    ch, cw, face_rect, int(mask_dilation), f_can,
+                    "rect", dev, torch.float32))
+                full_masks.append(
+                    _feather_mask(ch, cw, f_can, dev, torch.float32)
+                    .view(1, 1, ch, cw))
+
+            face_mask = torch.cat(face_masks, dim=0).movedim(1, -1)
+            full_mask = torch.cat(full_masks, dim=0).movedim(1, -1)
+            face_patch = self._colour_match(base, raw, face_mask, colour_match)
+            full_patch = self._colour_match(base, raw, full_mask, colour_match)
+
+            track = torch.ones((n, 1, 1, 1), device=dev, dtype=torch.float32)
+            if tracked_weights is not None:
+                for j, i in enumerate(range(c0, c1)):
+                    if i < len(tracked_weights):
+                        track[j] = float(tracked_weights[i])
+            aware = track.clone()
+            for j, i in enumerate(range(c0, c1)):
+                aware[j] *= float(size_weights[i])
+
+            face_aware_alpha = face_mask * aware * float(blend)
+            face_full_alpha = face_mask * track * float(blend)
+            crop_aware_alpha = full_mask * aware * float(blend)
+            crop_full_alpha = full_mask * track * float(blend)
+
+            face_aware = base * (1.0 - face_aware_alpha) + face_patch * face_aware_alpha
+            face_full = base * (1.0 - face_full_alpha) + face_patch * face_full_alpha
+            crop_aware = base * (1.0 - crop_aware_alpha) + full_patch * crop_aware_alpha
+            crop_full = base * (1.0 - crop_full_alpha) + full_patch * crop_full_alpha
+
+            def shrink(images):
+                return F.interpolate(
+                    images.movedim(-1, 1), size=(panel, panel), mode="area"
+                ).movedim(1, -1).cpu()
+
+            base_small = shrink(base)
+            raw_small = shrink(raw)
+            row_top = torch.cat(
+                [base_small, raw_small, shrink(face_aware), shrink(face_full)], dim=2)
+            row_bottom = torch.cat(
+                [base_small, raw_small, shrink(crop_aware), shrink(crop_full)], dim=2)
+            output[c0:c1] = torch.cat([row_top, row_bottom], dim=1)
+
+        report = (
+            f"frames={B}; top: original | raw | face_only=on,size_aware=on | "
+            f"face_only=on,size_aware=off; bottom: original | raw | "
+            f"face_only=off,size_aware=on | face_only=off,size_aware=off; "
+            f"dilation={int(mask_dilation)} feather={int(feather)} "
+            f"colour_match={float(colour_match):.2f} blend={float(blend):.2f} "
+            f"size_range={float(full_refine_face_px):.0f}-{float(passthrough_face_px):.0f}px"
+        )
+        print("[MiniMaxH3Face] stitch comparison: " + report)
+        return (output, report)
+
+
+# ----------------------------------------------------------------------------
+# 9. raw denoise comparison
+# ----------------------------------------------------------------------------
+
+
+class MiniMaxH3FaceRawDenoiseComparison:
+    """Render raw face generations made from one crop sequence at fixed denoise levels."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "original_crops": ("IMAGE",),
+            "raw_035": ("IMAGE",),
+            "raw_045": ("IMAGE",),
+            "raw_055": ("IMAGE",),
+            "raw_100": ("IMAGE",),
+            "panel_size": ("INT", {"default": 256, "min": 128, "max": 512, "step": 64}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("comparison", "report")
+    FUNCTION = "run"
+    CATEGORY = "TeaCache/MiniMaxH3/FaceInpaint"
+    TITLE = "MiniMax H3 Face Raw Denoise Comparison"
+    DESCRIPTION = (
+        "Compare identical tracked crops generated at constant denoise 0.35, 0.45, "
+        "0.55, and 1.00. No stitch or alignment is applied."
+    )
+
+    def run(self, original_crops, raw_035, raw_045, raw_055, raw_100, panel_size):
+        import comfy.model_management as mm
+        import torch.nn.functional as F
+
+        images = [original_crops, raw_035, raw_045, raw_055, raw_100]
+        batch = min(image.shape[0] for image in images)
+        if batch <= 0:
+            raise ValueError("No crop frames are available for raw denoise comparison")
+
+        panel = int(panel_size)
+        output = torch.empty((batch, panel, panel * len(images), 3), dtype=torch.float32)
+        try:
+            device = mm.get_torch_device()
+        except Exception:
+            device = original_crops.device
+
+        for start in range(0, batch, 4):
+            mm.throw_exception_if_processing_interrupted()
+            end = min(start + 4, batch)
+            panels = []
+            for image in images:
+                frames = image[start:end, ..., :3].to(device).float()
+                panels.append(F.interpolate(
+                    frames.movedim(-1, 1), size=(panel, panel), mode="area"
+                ).movedim(1, -1).cpu())
+            output[start:end] = torch.cat(panels, dim=2)
+
+        report = (
+            f"frames={batch}; original | denoise=0.35 | denoise=0.45 | "
+            f"denoise=0.55 | denoise=1.00 (new face); panel={panel}px; "
+            "raw tracked crops only; constant per-frame strength; same seed"
+        )
+        print("[MiniMaxH3Face] raw denoise comparison: " + report)
+        return (output, report)
+
+
+# ----------------------------------------------------------------------------
+# 10. debug info
 # ----------------------------------------------------------------------------
 
 
@@ -1274,7 +1789,10 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3FaceInjectVideoLatent": MiniMaxH3FaceInjectVideoLatent,
     "MiniMaxH3FaceAudioLock": MiniMaxH3FaceAudioLock,
     "MiniMaxH3FacePerFrameDenoise": MiniMaxH3FacePerFrameDenoise,
+    "MiniMaxH3FaceLandmarkAlign": MiniMaxH3FaceLandmarkAlign,
     "MiniMaxH3FaceStitch": MiniMaxH3FaceStitch,
+    "MiniMaxH3FaceStitchOptionsComparison": MiniMaxH3FaceStitchOptionsComparison,
+    "MiniMaxH3FaceRawDenoiseComparison": MiniMaxH3FaceRawDenoiseComparison,
     "MiniMaxH3FaceTransformInfo": MiniMaxH3FaceTransformInfo,
 }
 
