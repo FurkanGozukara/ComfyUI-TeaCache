@@ -19,7 +19,7 @@ Sol-Attn is a training-free sparse attention method for accelerating image
 and video generation. It performs dynamic block routing during online softmax
 and reuses proxy scores to approximate unselected blocks, avoiding a
 materialized routing map while preserving visual quality. CuTe DSL kernels
-support SM90, SM100, and SM120; SM80 and SM89 use Triton kernels.
+support SM89, SM90, SM100, and SM120; other supported architectures use Triton.
 
 ## Requirements
 
@@ -46,10 +46,11 @@ The public `sol_attn(...)` API selects the implementation from `q.device`:
 
 | GPU architecture | Example GPU | Preferred backend |
 |---|---|---|
+| SM89 | RTX 4090 | CuTe DSL |
 | SM90 | H100 | CuTe DSL |
 | SM100 | GB200 | CuTe DSL |
 | SM120 | RTX 5090 | CuTe DSL |
-| SM80 / SM89 | A100 / RTX 4090 | Triton |
+| SM80 / other SM8x | A100 / RTX 30-series | Triton |
 
 CuTe DSL and `cuda-python` are optional at runtime. When either cannot be
 imported, the same public API falls back to Triton.

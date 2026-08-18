@@ -24,8 +24,9 @@ reference (whose measured full line is 3.97x on the denoise+decode hot path):
     routed sparsely with the whole prefix as an exact KV sink and prefix query rows recomputed
     densely (the released H3 policy: `tau=1.0`, `diag`, first 20% steps and first 2 blocks
     dense). The vendored kernel (Apache-2.0, see `minimax_h3/sol_attn/`) uses CuTe DSL on
-    SM90/SM100/SM120 where available and Triton on every other GPU >= SM80, including RTX
-    30xx/40xx/50xx on Windows.
+    SM89/SM90/SM100/SM120 where available and Triton on every other GPU >= SM80, including
+    RTX 30xx/40xx/50xx on Windows. SM89 uses the native CuTe path when CUTLASS DSL is installed
+    and otherwise retains the Triton fallback.
   - *Per-GPU auto verification*: on the first eligible call the kernel is compiled, checked
     against dense SDPA on the model's own tensors (route-everything must match bit-closely),
     and micro-benchmarked against your current attention backend (e.g. SageAttention). It is

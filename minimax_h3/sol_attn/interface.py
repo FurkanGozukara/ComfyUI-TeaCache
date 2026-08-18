@@ -8,6 +8,7 @@ import torch
 
 BLOCK_SIZE = 64
 _CUTE_BACKENDS = {
+    (8, 9): "cute_sm89",
     (9, 0): "cute_sm90",
     (10, 0): "cute_sm100",
     (12, 0): "cute_sm120",
@@ -86,6 +87,14 @@ def _backend_for_arch(
     return "triton"
 
 
+def get_sol_attn_backend(device: torch.device | str | int | None = None) -> str:
+    """Return the backend selected for ``device`` without compiling it."""
+
+    if device is None:
+        device = torch.cuda.current_device()
+    return _backend_for_arch(tuple(torch.cuda.get_device_capability(device)))
+
+
 def _validate_cute(arch, tokens, kv_splits):
     if arch != (9, 0) and kv_splits != 1:
         raise ValueError("kv_splits=2/4 is currently available on SM90 only")
@@ -137,6 +146,33 @@ def _compile_sm90(
         *args,
         scale,
         sink_range,
+        stream=stream,
+        options="--enable-tvm-ffi",
+    )
+    _compiled[key] = compiled
+    return compiled, args
+
+
+def _compile_sm89(
+    key,
+    tensors,
+    scale,
+    sink_start_block,
+    sink_end_block,
+    stream,
+):
+    import cutlass.cute as cute
+
+    from .sm89 import make_kernel
+
+    operator = make_kernel()
+    args = _to_cute_tensors(tensors)
+    compiled = cute.compile(
+        operator,
+        *args,
+        scale,
+        sink_start_block,
+        sink_end_block,
         stream=stream,
         options="--enable-tvm-ffi",
     )
@@ -232,7 +268,33 @@ def _sol_attn_cute(
         stream = _stream(q.device)
         key = (q.device.index, arch, batch, tokens, heads, kv_splits)
 
-        if arch == (9, 0):
+        if arch == (8, 9):
+            sink_start_block, sink_end_block = _sink_block_range(
+                tokens,
+                sink_start,
+                sink_tokens,
+            )
+            tensors = [q, k, v, output, kc, vc, threshold, lse]
+            compiled = _compiled.get(key)
+            if compiled is None:
+                compiled, args = _compile_sm89(
+                    key,
+                    tensors,
+                    scale,
+                    sink_start_block,
+                    sink_end_block,
+                    stream,
+                )
+            else:
+                args = _to_cute_tensors(tensors)
+            compiled(
+                *args,
+                scale,
+                sink_start_block,
+                sink_end_block,
+                stream=stream,
+            )
+        elif arch == (9, 0):
             if sink_tokens:
                 sink_start_block, sink_end_block = _sink_block_range(
                     tokens,
@@ -396,4 +458,4 @@ def sol_attn(
     )
 
 
-__all__ = ["sol_attn"]
+__all__ = ["get_sol_attn_backend", "sol_attn"]
