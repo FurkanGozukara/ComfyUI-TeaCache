@@ -43,6 +43,11 @@ import torch.nn.functional as F
 import comfy.model_management
 import comfy.patcher_extension
 
+try:
+    from comfy.model_prefetch import pause_malloc_graph
+except ImportError:  # ComfyUI versions before the allocation compiler.
+    from contextlib import nullcontext as pause_malloc_graph
+
 _SOL_ATTN = None
 _SOL_ATTN_ERROR = None
 
@@ -204,7 +209,9 @@ class H3Optimizer:
             if index == 0:
                 h_in = img.clone()
                 out = original(args)["img"]
-                resid = (out - h_in)
+                # Cache tensors outlive the compiler's per-block allocation scope.
+                with pause_malloc_graph():
+                    resid = out - h_in
                 del h_in
                 skip = False
                 if cache.prev_resid is not None and cache.tail_resid is not None and self.fbc_window_open():
@@ -225,7 +232,8 @@ class H3Optimizer:
                     self.fbc_skipped_steps += 1
                 else:
                     self.fbc_computed_steps += 1
-                    cache.h_b0 = out.clone()
+                    with pause_malloc_graph():
+                        cache.h_b0 = out.clone()
                 return {"img": out}
 
             if cache.skip:
@@ -237,7 +245,8 @@ class H3Optimizer:
 
             out = original(args)["img"]
             if index == self.last_block and cache.h_b0 is not None:
-                cache.tail_resid = self._to_cache_device(out - cache.h_b0)
+                with pause_malloc_graph():
+                    cache.tail_resid = self._to_cache_device(out - cache.h_b0)
                 cache.h_b0 = None
             if index == self.last_block:
                 self._maybe_log_final_step()
