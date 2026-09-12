@@ -22,17 +22,30 @@ reference (whose measured full line is 3.97x on the denoise+decode hot path):
     and a consecutive-skip cap are exposed.
   - *Sol-Attn sparse attention*: the packed `[text | cond | audio | video]` self-attention is
     routed sparsely with the whole prefix as an exact KV sink and prefix query rows recomputed
-    densely (the released H3 policy: `tau=1.0`, `diag`, first 20% steps and first 2 blocks
-    dense). The vendored kernel (Apache-2.0, see `minimax_h3/sol_attn/`) uses CuTe DSL on
-    SM89/SM90/SM100/SM120 where available and Triton on every other GPU >= SM80, including
-    RTX 30xx/40xx/50xx on Windows. SM89 uses the native CuTe path when CUTLASS DSL is installed
-    and otherwise retains the Triton fallback.
-  - *Per-GPU auto verification*: on the first eligible call the kernel is compiled, checked
-    against dense SDPA on the model's own tensors (route-everything must match bit-closely),
-    and micro-benchmarked against your current attention backend (e.g. SageAttention). It is
-    kept only where it is both correct and faster; otherwise that GPU silently keeps its
-    incumbent attention. Any sparse-path exception permanently falls back to dense for the
-    process.
+    densely (`tau=1.0`, first 20% of steps and first 2 blocks dense). `sparse_backend=auto`
+    compares native **Comfy Kitchen SOL** with the bundled CuTe/Triton kernel. Kitchen uses
+    H3's strided QKV views directly, avoiding three full-size copies, and defaults to **256
+    extra routed tokens** to reduce sparse approximation and brightness/detail pulsing.
+    This uses the upstream [token-routing improvement](https://github.com/Comfy-Org/comfy-kitchen/pull/156)
+    in `comfy-kitchen>=0.2.33`. Prefix queries retain full-precision SDPA in both backends.
+    The bundled backend remains available on NVIDIA SM80+; specialized CuTe kernels are used
+    where supported, otherwise Triton.
+  - *Final detail step*: `sparse_dense_last_steps=1` keeps the final denoising step dense and
+    recomputes the block stack. Set it to `0` for the original sparse schedule. FirstBlockCache
+    always computes the final step, including 4/8-step schedules.
+  - *Per-workload verification*: each candidate's all-block attention must pass a finite,
+    relative-L2 check against SDPA on the model's tensors. Auto mode times the **complete**
+    sparse path, including conversions and dense prefix queries, and requires a 5% gain over
+    the current attention backend. Decisions include device, dtype, head count, sequence
+    layout, prefix, scale and token budget. A failure or slowdown for one workload does not
+    disable acceleration for other workloads. Startup verification runs outside ComfyUI's
+    allocation compiler; normal model computation remains compiled.
+
+Existing workflows need no rewiring: the three new controls are appended after the original
+widgets. Restart ComfyUI after updating this node and its requirements. The `4x` name describes
+the original reference acceleration stack, not a promised speedup on every GPU or step count.
+See [SOL update validation](docs/sol_attention_update.md) for measured results and limits.
+
 - **`MiniMax H3 VAE Speedup`** (`VAE -> VAE`): place after the video `VAELoader`. Feeds the
   identical-shape spatial decode tiles through the ViT decoder as one batch instead of one
   launch per tile — same arithmetic, up to ~2x faster decode. Measured bit-identical on RTX
@@ -45,7 +58,8 @@ reference (whose measured full line is 3.97x on the denoise+decode hot path):
 Notes: the AdaLN-precompute stage of the reference line is already baked into ComfyUI's H3
 checkpoints (`adaln_t_table` curve basis), and ComfyUI core already fuses QKV projection,
 RMSNorm+partial-RoPE and SwiGLU via comfy-kitchen, so those stages are not duplicated here.
-The first sparse run pays a one-time Triton compile (~10 s, cached on disk afterwards).
+The first eligible workload pays backend verification/benchmarking and any bundled-kernel
+compilation; subsequent matching calls reuse the decision.
 
 ## MiniMax H3 Face Inpaint (YOLO face refinement)
 

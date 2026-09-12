@@ -12,9 +12,9 @@ failure degrades to the baseline instead of killing the run:
 2. **Sol-Attn sparse attention** (`sol_attn_h3.py` in the reference): the packed
    [text | cond | audio | video] self-attention is routed sparsely with the prefix (everything
    before the target-video tail) as an exact KV sink, and the prefix's own query rows recomputed
-   densely. The released policy: tau=1.0, `diag` threshold, first steps and first 2 blocks dense.
-   The vendored kernel dispatches CuTe DSL on SM90/100/120 when available and Triton everywhere
-   else (>= SM80), which covers RTX 30xx/40xx/50xx on Windows.
+   densely. Native Comfy Kitchen SOL adds token routing and avoids full-size QKV copies;
+   the bundled CuTe/Triton implementation remains a verified candidate/fallback. The first
+   steps, first 2 blocks and final step stay dense by default.
 
 3. **Batched tiled VAE decode** (`vae_shard.py` in the reference): the video VAE decodes each
    spatial tile in its own launch; the tiles are identical in shape and the ViT decoder is
@@ -44,6 +44,11 @@ import comfy.model_management
 import comfy.patcher_extension
 
 try:
+    import comfy_kitchen as ck
+except ImportError:
+    ck = None
+
+try:
     from comfy.model_prefetch import pause_malloc_graph
 except ImportError:  # ComfyUI versions before the allocation compiler.
     from contextlib import nullcontext as pause_malloc_graph
@@ -70,10 +75,10 @@ def _load_sol_attn():
     return _SOL_ATTN
 
 
-def _dense_bthd(q, k, v):
-    """SDPA over contiguous [B, T, H, D], same layout out."""
+def _dense_bthd(q, k, v, scale=None):
+    """SDPA over [B, T, H, D], same layout out."""
     out = F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=0.0, is_causal=False)
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=0.0, is_causal=False, scale=scale)
     return out.transpose(1, 2)
 
 
@@ -96,7 +101,8 @@ class H3Optimizer:
 
     def __init__(self, num_blocks, fbc_enabled, fbc_threshold, fbc_start_percent, fbc_end_percent,
                  fbc_max_consecutive, fbc_cache_device, sparse_mode, sparse_tau, sparse_dense_steps_pct,
-                 sparse_dense_layers, sparse_min_video_rows, verbose):
+                 sparse_dense_layers, sparse_min_video_rows, verbose, sparse_backend="auto",
+                 sparse_extra_tokens=256, sparse_dense_last_steps=1):
         self.num_blocks = num_blocks
         self.last_block = num_blocks - 1
         self.fbc_enabled = fbc_enabled
@@ -110,6 +116,9 @@ class H3Optimizer:
         self.sparse_dense_steps_pct = float(sparse_dense_steps_pct)
         self.sparse_dense_layers = int(sparse_dense_layers)
         self.sparse_min_video_rows = int(sparse_min_video_rows)
+        self.sparse_backend = sparse_backend
+        self.sparse_extra_tokens = int(sparse_extra_tokens)
+        self.sparse_dense_last_steps = int(sparse_dense_last_steps)
         self.verbose = verbose
 
         # per-run state
@@ -124,12 +133,12 @@ class H3Optimizer:
         self.fbc_computed_steps = 0
         self._last_sigma = None
 
-        # per-process sparse resolution: None = undecided, True/False = decided
+        # Backend decisions are specific to the full attention workload.
         self.sparse_resolved = None if sparse_mode == "auto" else (sparse_mode == "enabled")
         self.sparse_failed_reason = None
         self.sparse_calls = 0
         self.dense_calls = 0
-        self._gate_done = set()
+        self._gate_done = {}
 
     # ------------------------------------------------------------------ run observation
 
@@ -193,8 +202,9 @@ class H3Optimizer:
     def fbc_window_open(self):
         if not self.fbc_enabled or self.total_steps <= 0:
             return False
+        if self.step_index >= self.total_steps - max(1, self.sparse_dense_last_steps):
+            return False
         pct = self.step_index / max(self.total_steps, 1)
-        # end bound is strict so the schedule's final step always computes (detail-setting step)
         return self.fbc_start_percent <= pct < self.fbc_end_percent
 
     def block_patch(self, index):
@@ -263,9 +273,11 @@ class H3Optimizer:
     # ------------------------------------------------------------------ sparse attention
 
     def _sparse_eligible(self, q, heads, kwargs):
-        if self.sparse_resolved is False or self.sparse_failed_reason is not None:
+        if self.sparse_mode == "disabled":
             return False
         if not kwargs.get("skip_reshape", False) or kwargs.get("mask") is not None:
+            return False
+        if q.device.type != "cuda" or q.dtype not in (torch.bfloat16, torch.float16):
             return False
         if q.ndim != 4 or q.shape[0] != 1 or q.shape[1] != heads or q.shape[-1] != 128:
             return False
@@ -279,95 +291,120 @@ class H3Optimizer:
             return False
         if self.step_index < math.ceil(self.sparse_dense_steps_pct * max(self.total_steps, 1)):
             return False
+        if self.step_index >= self.total_steps - self.sparse_dense_last_steps:
+            return False
         return True
 
-    def _gate_and_bench(self, sol_attn, qb, kb, vb, incumbent):
-        """Route-everything correctness gate + micro-benchmark vs the incumbent backend.
+    def _sparse_key(self, q, k, v, kwargs):
+        return (q.device, q.dtype, tuple(q.shape), q.stride(), k.stride(), v.stride(),
+                self.video_start, kwargs.get("scale"), self.sparse_backend,
+                self.sparse_tau, self.sparse_extra_tokens)
 
-        Runs once per (device, sequence-length) pair, on the model's own tensors. A sparse
-        configuration that is wrong or slower than what the user already runs is disabled
-        for the rest of the process.
+    def _run_sparse(self, backend, q, k, v, *, tau, scale=None, prefix=0):
+        qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
+        if backend == "comfy_kitchen":
+            # Kitchen accepts H3's strided fused-QKV views without full-size copies.
+            sinks = [0, (prefix + 63) // 64]
+            out = ck.sol_attn(qb, kb, vb, tau=tau, scale=scale, sink_blocks=sinks,
+                              sink_q=sinks, token_aug=self.sparse_extra_tokens)
+        else:
+            sol_attn = _load_sol_attn()
+            if sol_attn is None:
+                raise RuntimeError(_SOL_ATTN_ERROR or "sol_attn import failed")
+            out = sol_attn(*(x.to(torch.bfloat16).contiguous() for x in (qb, kb, vb)),
+                           tau=tau, scale=scale, thresh_type="diag", sink_start=0, sink_tokens=prefix)
+            out = out.to(q.dtype)
+        if prefix:
+            # Preserve full-precision conditioning queries even with INT8 exact kernels.
+            out[:, :prefix] = _dense_bthd(qb[:, :prefix], kb, vb, scale=scale)
+        return out
+
+    def _gate_and_bench(self, q, k, v, kwargs, incumbent):
+        """Verify numerics, then time the full path including copies and dense prefix.
+
+        Losing/unavailable backends affect only this workload. This first-call work
+        runs outside ComfyUI's allocation graph; steady-state attention stays inside.
         """
-        key = (qb.device.index, qb.shape[1])
-        if key in self._gate_done:
-            return True
-        t_compile = time.perf_counter()
-        got = sol_attn(qb, kb, vb, tau=-1000.0, thresh_type="diag")
-        torch.cuda.synchronize(qb.device)
-        compile_s = time.perf_counter() - t_compile
-        want = _dense_bthd(qb, kb, vb)
-        rel = (torch.linalg.vector_norm(got.float() - want.float())
-               / torch.linalg.vector_norm(want.float()).clamp_min(1e-12)).item()
-        del got, want
-        if rel > 0.02:
-            self.sparse_failed_reason = f"correctness gate failed: route-all rel_l2 {rel:.5f} > 0.02"
-            logging.warning(f"[MiniMaxH3Speed] {self.sparse_failed_reason}; using dense attention")
-            return False
+        backends = []
+        if self.sparse_backend in ("auto", "comfy_kitchen"):
+            available = getattr(ck, "sol_attn_is_available", None)
+            if available is not None and available(q.device):
+                backends.append("comfy_kitchen")
+        if self.sparse_backend in ("auto", "vendored"):
+            backends.append("vendored")
+        scale = kwargs.get("scale")
 
-        def run_sparse():
-            return sol_attn(qb, kb, vb, tau=self.sparse_tau, thresh_type="diag",
-                            sink_start=0, sink_tokens=self.video_start)
-
-        def timeit(fn, n=3):
+        def timeit(fn, n=5):
             fn()
-            torch.cuda.synchronize(qb.device)
+            torch.cuda.synchronize(q.device)
             t0 = time.perf_counter()
             for _ in range(n):
                 fn()
-            torch.cuda.synchronize(qb.device)
+            torch.cuda.synchronize(q.device)
             return (time.perf_counter() - t0) / n
 
-        t_sparse = timeit(run_sparse)
         t_incumbent = timeit(incumbent)
-        speedup = t_incumbent / max(t_sparse, 1e-9)
-        decided = speedup >= 1.05 if self.sparse_mode == "auto" else True
-        logging.info(f"[MiniMaxH3Speed] sparse attention gate on {torch.cuda.get_device_name(qb.device)}: "
-                     f"rel_l2 {rel:.5f}, kernel compile {compile_s:.1f}s, sparse {t_sparse * 1000:.2f} ms vs "
-                     f"incumbent {t_incumbent * 1000:.2f} ms ({speedup:.2f}x) -> "
-                     f"{'ENABLED' if decided else 'disabled (not faster on this GPU)'}")
-        if not decided:
-            self.sparse_resolved = False
-            return False
-        self.sparse_resolved = True
-        self._gate_done.add(key)
-        return True
+        fastest, best_time = None, float("inf")
+        for backend in backends:
+            try:
+                got = self._run_sparse(backend, q, k, v, tau=-1000.0, scale=scale)
+                want = _dense_bthd(*(x.transpose(1, 2) for x in (q, k, v)), scale=scale)
+                rel = (torch.linalg.vector_norm(got.float() - want.float()) /
+                       torch.linalg.vector_norm(want.float()).clamp_min(1e-12)).item()
+                del got, want
+                if not math.isfinite(rel) or rel > 0.02:
+                    raise RuntimeError(f"route-all rel_l2 {rel:.5f} exceeds 0.02 or is nonfinite")
+                run = lambda: self._run_sparse(backend, q, k, v, tau=self.sparse_tau,
+                                                scale=scale, prefix=self.video_start)
+                out = run()
+                finite = bool(torch.isfinite(out).all())
+                del out
+                if not finite:
+                    raise RuntimeError("sparse output is nonfinite")
+                elapsed = timeit(run)
+                speedup = t_incumbent / max(elapsed, 1e-9)
+                logging.info(f"[MiniMaxH3Speed] {backend} gate: rel_l2 {rel:.5f}, "
+                             f"complete sparse {elapsed * 1000:.2f} ms vs dense "
+                             f"{t_incumbent * 1000:.2f} ms ({speedup:.2f}x)")
+                if elapsed < best_time and (self.sparse_mode == "enabled" or speedup >= 1.05):
+                    fastest, best_time = backend, elapsed
+            except Exception as exc:  # Optional kernels may not compile on this GPU/runtime.
+                logging.warning(f"[MiniMaxH3Speed] {backend} unavailable for this workload: "
+                                f"{type(exc).__name__}: {exc}")
+        self.sparse_resolved = fastest is not None
+        logging.info(f"[MiniMaxH3Speed] attention selected: {fastest or 'incumbent dense'} "
+                     f"on {torch.cuda.get_device_name(q.device)}, {q.shape[2]} tokens")
+        return fastest
 
     def attention_override(self, func, q, k, v, heads, **kwargs):
         try:
             if self._sparse_eligible(q, heads, kwargs):
-                sol_attn = _load_sol_attn()
-                if sol_attn is None:
-                    self.sparse_failed_reason = _SOL_ATTN_ERROR or "sol_attn import failed"
-                else:
-                    return self._sparse_attention(sol_attn, func, q, k, v, heads, kwargs)
+                if q.shape == k.shape == v.shape and q.dtype == k.dtype == v.dtype:
+                    return self._sparse_attention(func, q, k, v, heads, kwargs)
         except Exception as e:  # noqa: BLE001 - never let the sparse path break sampling
             self.sparse_failed_reason = f"{type(e).__name__}: {e}"
-            logging.warning(f"[MiniMaxH3Speed] sparse attention failed, falling back to dense "
-                            f"for the rest of this process: {self.sparse_failed_reason}")
+            self._gate_done[self._sparse_key(q, k, v, kwargs)] = None
+            logging.warning(f"[MiniMaxH3Speed] sparse attention failed, using dense for this workload: "
+                            f"{self.sparse_failed_reason}")
         self.dense_calls += 1
         return func(q, k, v, heads, **kwargs)
 
-    def _sparse_attention(self, sol_attn, func, q, k, v, heads, kwargs):
-        # [1, H, S, D] -> contiguous bf16 [1, S, H, D] (the kernel contract)
-        qb = q.transpose(1, 2).to(torch.bfloat16).contiguous()
-        kb = k.transpose(1, 2).to(torch.bfloat16).contiguous()
-        vb = v.transpose(1, 2).to(torch.bfloat16).contiguous()
-
-        if self.sparse_resolved is not True or (qb.device.index, qb.shape[1]) not in self._gate_done:
-            ok = self._gate_and_bench(sol_attn, qb, kb, vb,
-                                      incumbent=lambda: func(q, k, v, heads, **kwargs))
-            if not ok:
-                self.dense_calls += 1
-                return func(q, k, v, heads, **kwargs)
-
-        out = sol_attn(qb, kb, vb, tau=self.sparse_tau, thresh_type="diag",
-                       sink_start=0, sink_tokens=self.video_start)
-        # The sink keeps the prefix exact as *keys*; its own *query* rows must be dense.
-        vs = self.video_start
-        out[:, :vs] = _dense_bthd(qb[:, :vs], kb, vb)
+    def _sparse_attention(self, func, q, k, v, heads, kwargs):
+        key = self._sparse_key(q, k, v, kwargs)
+        if key not in self._gate_done:
+            with pause_malloc_graph():
+                self._gate_done[key] = self._gate_and_bench(
+                    q, k, v, kwargs, incumbent=lambda: func(q, k, v, heads, **kwargs))
+        backend = self._gate_done[key]
+        if backend is None:
+            self.dense_calls += 1
+            return func(q, k, v, heads, **kwargs)
+        out = self._run_sparse(backend, q, k, v, tau=self.sparse_tau,
+                               scale=kwargs.get("scale"), prefix=self.video_start)
         self.sparse_calls += 1
-        s = out.shape[1]
-        return out.reshape(1, s, heads * 128).to(q.dtype)
+        if kwargs.get("skip_output_reshape", False):
+            return out.transpose(1, 2)
+        return out.reshape(1, out.shape[1], heads * 128)
 
 
 class MiniMaxH3SpeedOptimizer:
@@ -398,6 +435,9 @@ class MiniMaxH3SpeedOptimizer:
                     "label_off": "DISABLED (normal)",
                     "tooltip": "Master switch for the complete 4x preset path. Disable it to pass through the original model and disable the linked MiniMax H3 VAE Speedup.",
                 }),
+                "sparse_backend": (["auto", "comfy_kitchen", "vendored"], {"default": "auto", "tooltip": "Auto compares native Comfy Kitchen SOL with the bundled CuTe/Triton kernel. Only verified, faster paths are used in auto attention mode."}),
+                "sparse_extra_tokens": ("INT", {"default": 256, "min": 0, "max": 256, "step": 64, "tooltip": "Comfy Kitchen: extra tokens attended outside routed blocks. 256 reduces sparse approximation and brightness/detail pulsing; 0 is faster. Requires comfy-kitchen >=0.2.33."}),
+                "sparse_dense_last_steps": ("INT", {"default": 1, "min": 0, "max": 50, "tooltip": "Final steps use dense attention and recompute the block stack to protect fine detail. 0 keeps the original sparse schedule; the final block stack still always computes."}),
             },
         }
 
@@ -414,7 +454,8 @@ class MiniMaxH3SpeedOptimizer:
     def apply(self, model, first_block_cache, fbc_threshold, fbc_start_percent, fbc_end_percent,
               fbc_max_consecutive, sparse_attention, sparse_dense_steps_pct, sparse_dense_layers,
               sparse_tau=1.0, sparse_min_video_rows=4096, fbc_cache_device="gpu", verbose=True,
-              enable_speedup=True):
+              enable_speedup=True, sparse_backend="auto", sparse_extra_tokens=256,
+              sparse_dense_last_steps=1):
         if not enable_speedup:
             return (model, False)
 
@@ -440,6 +481,9 @@ class MiniMaxH3SpeedOptimizer:
             sparse_dense_layers=sparse_dense_layers,
             sparse_min_video_rows=sparse_min_video_rows,
             verbose=verbose,
+            sparse_backend=sparse_backend,
+            sparse_extra_tokens=sparse_extra_tokens,
+            sparse_dense_last_steps=sparse_dense_last_steps,
         )
 
         def wrapper(executor, x, timestep, context, transformer_options={}, **kwargs):
