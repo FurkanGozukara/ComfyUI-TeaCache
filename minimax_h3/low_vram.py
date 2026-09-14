@@ -155,19 +155,25 @@ def _make_mlp_forward(chunks, min_tokens):
     return forward
 
 
-def _block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
+def _block_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
     """DiTBlock.forward that hands its normed attention input over to attn.
 
     The handoff is checked per call rather than assumed: another node may own this block's
     attn.forward, either because it patched first or because it patched after us, and only
     a forward that advertises _h3_accepts_list knows what to do with the list. Anything
     else gets the plain tensor and simply misses the early release.
+
+    ``attention`` mirrors ComfyUI's DiTBlock.forward: block-replace patches (the SOL/sparse
+    attention optimizer, ControlNets) pass their own attention callable through it. When one
+    is given it receives the plain tensor, exactly like the stock block.
     """
     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
     h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
-    if getattr(self.attn.forward, "_h3_accepts_list", False):
-        h = [h]
-    x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
+    if attention is None:
+        attention = self.attn
+        if getattr(self.attn.forward, "_h3_accepts_list", False):
+            h = [h]
+    x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options), mod_segments)
     h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
     return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
