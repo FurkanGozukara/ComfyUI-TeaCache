@@ -451,11 +451,41 @@ class MiniMaxH3SpeedOptimizer:
                    "The master switch can also drive the paired VAE speedup node. "
                    "Techniques that don't work or don't win on your GPU fall back to the normal path automatically.")
 
+    @classmethod
+    def _invalid_inputs(cls, values):
+        """Numbers and choices that ComfyUI's prompt validation would have rejected."""
+        spec = cls.INPUT_TYPES()
+        invalid = []
+        for name, (kind, *options) in {**spec["required"], **spec["optional"]}.items():
+            value = values[name]
+            if isinstance(kind, list):
+                valid = value in kind
+            elif kind in ("INT", "FLOAT"):
+                limits = options[0]
+                valid = (isinstance(value, (int, float)) and not isinstance(value, bool)
+                         and limits["min"] <= value <= limits["max"])
+            else:
+                continue
+            if not valid:
+                invalid.append(f"{name}={value!r}")
+        return invalid
+
     def apply(self, model, first_block_cache, fbc_threshold, fbc_start_percent, fbc_end_percent,
               fbc_max_consecutive, sparse_attention, sparse_dense_steps_pct, sparse_dense_layers,
               sparse_tau=1.0, sparse_min_video_rows=4096, fbc_cache_device="gpu", verbose=True,
               enable_speedup=True, sparse_backend="auto", sparse_extra_tokens=256,
               sparse_dense_last_steps=1):
+        # Prompt validation does not always run before this node: other extensions patch it and
+        # saved API prompts bypass the frontend. A workflow whose widget values were saved in the
+        # wrong order (see web/js/minimax_h3_speed.js) then arrives here, e.g. with
+        # fbc_end_percent='gpu'. Degrade to the normal path instead of killing the run.
+        invalid = self._invalid_inputs(locals())
+        if invalid:
+            logging.warning("[MiniMaxH3Speed] speedup skipped, this node has invalid input values: "
+                            f"{', '.join(invalid)}. Its saved widget values are scrambled: reload the "
+                            "preset or recreate the node.")
+            return (model, False)
+
         if not enable_speedup:
             return (model, False)
 

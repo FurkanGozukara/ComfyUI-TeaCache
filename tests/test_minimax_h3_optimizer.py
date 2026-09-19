@@ -138,6 +138,23 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(self.module.MiniMaxH3SpeedOptimizer().apply(
             "original", True, 0.08, 0.15, 0.95, 3, "auto", 0.2, 2, enable_speedup=False), ("original", False))
 
+    def test_scrambled_widget_values_degrade_to_the_normal_path(self):
+        node_class = self.module.MiniMaxH3SpeedOptimizer
+        spec = node_class.INPUT_TYPES()
+        defaults = {name: options[0]["default"] for name, (_kind, *options) in
+                    {**spec["required"], **spec["optional"]}.items() if name != "model"}
+        self.assertEqual(node_class._invalid_inputs({"model": "original", **defaults}), [])
+
+        # The reported prompt: values rotated six slots by the frontend, after the partial
+        # coercion of a prompt validation whose failure another extension had discarded.
+        with self.assertLogs(level="WARNING") as logs:
+            result = node_class().apply(
+                "original", True, 1.0, 4096.0, "gpu", 1, False, 1.0, 0, sparse_tau=0.15,
+                sparse_min_video_rows=0, fbc_cache_device=3, verbose=True, enable_speedup=True)
+        self.assertEqual(result, ("original", False))
+        for expected in ("fbc_start_percent=4096.0", "fbc_end_percent='gpu'", "sparse_attention=False", "fbc_cache_device=3"):
+            self.assertIn(expected, logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()

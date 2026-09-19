@@ -4,6 +4,7 @@ const MASTER_WIDGET = "enable_speedup";
 const OPTIMIZER_CLASS = "MiniMaxH3SpeedOptimizer";
 const BACKEND_ORDER = Symbol("minimaxH3BackendWidgetOrder");
 const BACKEND_DEFAULTS = Symbol("minimaxH3BackendWidgetDefaults");
+const REORDER_REFUSED = Symbol("minimaxH3WidgetReorderRefused");
 const INSTALLED = Symbol("minimaxH3MasterSwitchInstalled");
 const CALLBACK_INSTALLED = Symbol("minimaxH3MasterSwitchCallbackInstalled");
 
@@ -42,43 +43,76 @@ function saveValuesInBackendOrder(node, data) {
     data.widgets_values = backendOrderedWidgets(node).map((widget) => values.get(widget));
 }
 
+// Which frontend saved a workflow, and whether it honoured onSerialize, is unknown when it is
+// loaded again. Every layout the values can arrive in is therefore read as a candidate (one
+// value per backend-ordered widget, undefined = not saved) and the first one whose values fit
+// the widgets wins. Only when nothing fits are the values truly scrambled.
 function loadValuesInBackendOrder(node, data) {
-    const named = data?.widgets_values_named;
-    const positional = Array.isArray(data?.widgets_values) ? data.widgets_values : [];
     const widgets = backendOrderedWidgets(node);
+    const defaults = node[BACKEND_DEFAULTS];
+    const fits = (values) => values.some((value) => value !== undefined)
+        && widgets.every((widget, index) => {
+            const value = values[index];
+            if (value === undefined || !defaults.has(widget.name)) {
+                return true;
+            }
+            const choices = widget.options?.values;
+            return typeof value === typeof defaults.get(widget.name)
+                && (!Array.isArray(choices) || typeof value !== "string" || choices.includes(value));
+        });
+
+    const positional = Array.isArray(data?.widgets_values) ? data.widgets_values : [];
+    const named = data?.widgets_values_named;
+    const master = widgets.filter((widget) => widget.name === MASTER_WIDGET);
+    const displayed = [...master, ...widgets.filter((widget) => widget.name !== MASTER_WIDGET)];
+    const candidates = [
+        widgets.map((widget, index) => positional[index]),
+        widgets.map((widget) => (named && Object.hasOwn(named, widget.name) ? named[widget.name] : undefined)),
+        widgets.map((widget) => positional[displayed.indexOf(widget)]),
+        widgets.map((widget) => widget.value),
+    ];
+    const values = candidates.find(fits);
     for (const [index, widget] of widgets.entries()) {
-        if (named && Object.hasOwn(named, widget.name)) {
-            widget.value = named[widget.name];
-        } else if (index < positional.length) {
-            widget.value = positional[index];
+        if (values) {
+            if (values[index] !== undefined) {
+                widget.value = values[index];
+            }
+        } else if (defaults.has(widget.name)) {
+            widget.value = widget.name === MASTER_WIDGET ? false : defaults.get(widget.name);
         }
     }
 
-    // Older versions of this script let frontend 1.53+ save the values in display order,
-    // which rotated them by one slot per reload (a combo value ends up in a number, ...).
-    // That cannot be undone, so fall back to the defaults with the speedup switched off.
-    const defaults = node[BACKEND_DEFAULTS];
-    if (widgets.some((widget) => defaults.has(widget.name) && typeof widget.value !== typeof defaults.get(widget.name))) {
-        for (const widget of widgets) {
-            if (defaults.has(widget.name)) {
-                widget.value = widget.name === MASTER_WIDGET ? false : defaults.get(widget.name);
-            }
-        }
+    // Older versions of this script let frontend 1.53+ save the values in display order and
+    // restore them in backend order: one slot of rotation per reload, which cannot be undone.
+    if (!values) {
         console.warn(`[MiniMaxH3Speed] node ${node.id}: saved widget values were scrambled by an older `
             + "version of this extension. They were reset to the defaults with the 4x speedup off; "
             + "reload the preset to get its tuned values back.");
     }
 }
 
+// Nothing in here may break loading or saving a workflow, whatever the frontend does.
+function guarded(label, run) {
+    try {
+        return run();
+    } catch (error) {
+        console.warn(`[MiniMaxH3Speed] ${label} skipped:`, error);
+        return undefined;
+    }
+}
+
 function promoteMasterSwitch(node) {
-    if (!node.widgets) {
+    if (!node.widgets || node[REORDER_REFUSED]) {
         return;
     }
 
+    // A frontend that does not allow reordering simply keeps the switch where it is. One
+    // splice call, so a refusal can never leave the list without the widget.
     const index = node.widgets.findIndex((widget) => widget.name === MASTER_WIDGET);
     if (index > 0) {
-        const [widget] = node.widgets.splice(index, 1);
-        node.widgets.unshift(widget);
+        const reordered = [node.widgets[index], ...node.widgets.slice(0, index), ...node.widgets.slice(index + 1)];
+        node[REORDER_REFUSED] = guarded("moving the master switch to the first row",
+            () => node.widgets.splice(0, reordered.length, ...reordered)) === undefined;
     }
 }
 
@@ -140,7 +174,8 @@ function installMasterSwitch(node) {
 
     // Workflow widget values are positional while the master switch is displayed first.
     // Frontends differ in how they reach serialization (1.53+ never calls node.serialize()),
-    // so translate the values in the node hooks instead of reordering node.widgets around it.
+    // and ComfyUI and SwarmUI each choose their own frontend version, so the values are
+    // translated in the node hooks instead of reordering node.widgets around internal methods.
     // A subgraph host needs none of this: its values follow its input slots, not its widgets.
     if (node.comfyClass === OPTIMIZER_CLASS) {
         node[BACKEND_ORDER] = node.widgets.map((candidate) => candidate.name);
@@ -149,13 +184,13 @@ function installMasterSwitch(node) {
         const originalOnSerialize = node.onSerialize;
         node.onSerialize = function (data) {
             const result = originalOnSerialize?.apply(this, arguments);
-            saveValuesInBackendOrder(this, data);
+            guarded("saving the widget values in backend order", () => saveValuesInBackendOrder(this, data));
             return result;
         };
 
         const originalOnConfigure = node.onConfigure;
         node.onConfigure = function (data) {
-            loadValuesInBackendOrder(this, data);
+            guarded("restoring the widget values", () => loadValuesInBackendOrder(this, data));
             return originalOnConfigure?.apply(this, arguments);
         };
     }
