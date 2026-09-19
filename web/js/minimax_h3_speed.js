@@ -3,6 +3,7 @@ import { app } from "../../../scripts/app.js";
 const MASTER_WIDGET = "enable_speedup";
 const OPTIMIZER_CLASS = "MiniMaxH3SpeedOptimizer";
 const BACKEND_ORDER = Symbol("minimaxH3BackendWidgetOrder");
+const BACKEND_DEFAULTS = Symbol("minimaxH3BackendWidgetDefaults");
 const INSTALLED = Symbol("minimaxH3MasterSwitchInstalled");
 const CALLBACK_INSTALLED = Symbol("minimaxH3MasterSwitchCallbackInstalled");
 
@@ -20,18 +21,53 @@ function isSpeedControlNode(node) {
     );
 }
 
-function restoreBackendOrder(node) {
-    if (!node.widgets || !node[BACKEND_ORDER]) {
+function serializedWidgets(node) {
+    return (node.widgets ?? []).filter((widget) => widget.serialize !== false);
+}
+
+// A sorted copy: node.widgets itself keeps the master switch first.
+function backendOrderedWidgets(node) {
+    const ranks = new Map(node[BACKEND_ORDER].map((name, index) => [name, index]));
+    const rank = (widget) => ranks.get(widget.name) ?? Number.MAX_SAFE_INTEGER;
+    return serializedWidgets(node).sort((left, right) => rank(left) - rank(right));
+}
+
+function saveValuesInBackendOrder(node, data) {
+    const displayed = serializedWidgets(node);
+    if (!Array.isArray(data?.widgets_values) || data.widgets_values.length !== displayed.length) {
         return;
     }
 
-    const ranks = new Map(node[BACKEND_ORDER].map((name, index) => [name, index]));
-    const stableIndex = new Map(node.widgets.map((widget, index) => [widget, index]));
-    node.widgets.sort((left, right) => {
-        const leftRank = ranks.get(left.name) ?? Number.MAX_SAFE_INTEGER;
-        const rightRank = ranks.get(right.name) ?? Number.MAX_SAFE_INTEGER;
-        return leftRank - rightRank || stableIndex.get(left) - stableIndex.get(right);
-    });
+    const values = new Map(displayed.map((widget, index) => [widget, data.widgets_values[index]]));
+    data.widgets_values = backendOrderedWidgets(node).map((widget) => values.get(widget));
+}
+
+function loadValuesInBackendOrder(node, data) {
+    const named = data?.widgets_values_named;
+    const positional = Array.isArray(data?.widgets_values) ? data.widgets_values : [];
+    const widgets = backendOrderedWidgets(node);
+    for (const [index, widget] of widgets.entries()) {
+        if (named && Object.hasOwn(named, widget.name)) {
+            widget.value = named[widget.name];
+        } else if (index < positional.length) {
+            widget.value = positional[index];
+        }
+    }
+
+    // Older versions of this script let frontend 1.53+ save the values in display order,
+    // which rotated them by one slot per reload (a combo value ends up in a number, ...).
+    // That cannot be undone, so fall back to the defaults with the speedup switched off.
+    const defaults = node[BACKEND_DEFAULTS];
+    if (widgets.some((widget) => defaults.has(widget.name) && typeof widget.value !== typeof defaults.get(widget.name))) {
+        for (const widget of widgets) {
+            if (defaults.has(widget.name)) {
+                widget.value = widget.name === MASTER_WIDGET ? false : defaults.get(widget.name);
+            }
+        }
+        console.warn(`[MiniMaxH3Speed] node ${node.id}: saved widget values were scrambled by an older `
+            + "version of this extension. They were reset to the defaults with the 4x speedup off; "
+            + "reload the preset to get its tuned values back.");
+    }
 }
 
 function promoteMasterSwitch(node) {
@@ -101,31 +137,26 @@ function installMasterSwitch(node) {
     }
 
     node[INSTALLED] = true;
-    node[BACKEND_ORDER] = node.widgets.map((candidate) => candidate.name);
 
-    // Workflow widget values are positional. Restore the backend order only while
-    // configuring/serializing, then return the master switch to the first visible row.
-    const originalConfigure = node.configure;
-    if (typeof originalConfigure === "function") {
-        node.configure = function (...args) {
-            restoreBackendOrder(this);
-            try {
-                return originalConfigure.apply(this, args);
-            } finally {
-                promoteMasterSwitch(this);
-            }
+    // Workflow widget values are positional while the master switch is displayed first.
+    // Frontends differ in how they reach serialization (1.53+ never calls node.serialize()),
+    // so translate the values in the node hooks instead of reordering node.widgets around it.
+    // A subgraph host needs none of this: its values follow its input slots, not its widgets.
+    if (node.comfyClass === OPTIMIZER_CLASS) {
+        node[BACKEND_ORDER] = node.widgets.map((candidate) => candidate.name);
+        node[BACKEND_DEFAULTS] = new Map(node.widgets.map((candidate) => [candidate.name, candidate.value]));
+
+        const originalOnSerialize = node.onSerialize;
+        node.onSerialize = function (data) {
+            const result = originalOnSerialize?.apply(this, arguments);
+            saveValuesInBackendOrder(this, data);
+            return result;
         };
-    }
 
-    const originalSerialize = node.serialize;
-    if (typeof originalSerialize === "function") {
-        node.serialize = function (...args) {
-            restoreBackendOrder(this);
-            try {
-                return originalSerialize.apply(this, args);
-            } finally {
-                promoteMasterSwitch(this);
-            }
+        const originalOnConfigure = node.onConfigure;
+        node.onConfigure = function (data) {
+            loadValuesInBackendOrder(this, data);
+            return originalOnConfigure?.apply(this, arguments);
         };
     }
 
