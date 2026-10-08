@@ -1,33 +1,9 @@
-"""MiniMax H3 speed optimizations for ComfyUI, ported from NVlabs/Sana `sol-engine`
-(models/minimax_h3/optimized, techniques/sparse_backends).
+"""H3 controls over ComfyUI's native sparse producer, FirstBlockCache and VAE batching.
 
-Three techniques, each independently switchable and each with a dense/eager fallback so a
-failure degrades to the baseline instead of killing the run:
-
-1. **FirstBlockCache** (`cache_line.py` in the reference): block 0 of the 50-block stack runs
-   every step; when its output residual barely moved since the previous step, the remaining 49
-   blocks are skipped and the cached tail residual is reused. This is the dominant win of the
-   reference acceleration line (2.58x of its 3.97x total).
-
-2. **Sol-Attn sparse attention** (`sol_attn_h3.py` in the reference): the packed
-   [text | cond | audio | video] self-attention is routed sparsely with the prefix (everything
-   before the target-video tail) as an exact KV sink, and the prefix's own query rows recomputed
-   densely. Native Comfy Kitchen SOL adds token routing and avoids full-size QKV copies;
-   the bundled CuTe/Triton implementation remains a verified candidate/fallback. The first
-   steps, first 2 blocks and final step stay dense by default.
-
-3. **Batched tiled VAE decode** (`vae_shard.py` in the reference): the video VAE decodes each
-   spatial tile in its own launch; the tiles are identical in shape and the ViT decoder is
-   batch-independent, so feeding them through as one batch is the same arithmetic, bit-identical,
-   with far less launch overhead.
-
-The AdaLN precompute of the reference line is already baked into ComfyUI's H3 checkpoints
-(`adaln_t_table` curve basis), and the fused QKV projection / fused RMSNorm+RoPE / fused SwiGLU
-already exist in ComfyUI core via comfy-kitchen, so those are not duplicated here.
-
-GPU support is decided at runtime: the sparse kernel is compiled, checked against dense SDPA on
-the model's own tensors (route-everything must match), micro-benchmarked against the incumbent
-attention backend, and only kept if it is both correct and faster on *this* GPU.
+SOL math and GPU kernels belong to ComfyUI/comfy-kitchen. This adapter preserves
+saved workflow controls, protects the first/final steps, composes existing block
+patches, and optionally benchmarks the complete native projected-attention path.
+SOL and FirstBlockCache are approximate; neither is a lossless speed switch.
 """
 
 import copy
@@ -38,49 +14,19 @@ import time
 import types
 
 import torch
-import torch.nn.functional as F
 
 import comfy.model_management
 import comfy.patcher_extension
 
 try:
-    import comfy_kitchen as ck
+    from comfy_extras import nodes_sparse_attention as native_sparse
 except ImportError:
-    ck = None
+    native_sparse = None
 
 try:
     from comfy.model_prefetch import pause_malloc_graph
 except ImportError:  # ComfyUI versions before the allocation compiler.
     from contextlib import nullcontext as pause_malloc_graph
-
-_SOL_ATTN = None
-_SOL_ATTN_ERROR = None
-
-
-def _load_sol_attn():
-    """Import the vendored sol_attn package once; remember why it failed if it does."""
-    global _SOL_ATTN, _SOL_ATTN_ERROR
-    if _SOL_ATTN is not None or _SOL_ATTN_ERROR is not None:
-        return _SOL_ATTN
-    try:
-        import sys
-        from . import sol_attn as vendored_pkg
-        # The vendored CuTe backends import `sol_attn.*` absolutely; give the nested package a
-        # top-level alias (unless a real installation already owns the name).
-        sys.modules.setdefault("sol_attn", vendored_pkg)
-        _SOL_ATTN = vendored_pkg.sol_attn
-    except Exception as e:  # noqa: BLE001 - any import failure means dense fallback
-        _SOL_ATTN_ERROR = f"{type(e).__name__}: {e}"
-        logging.warning(f"[MiniMaxH3Speed] sol_attn unavailable, sparse attention disabled: {_SOL_ATTN_ERROR}")
-    return _SOL_ATTN
-
-
-def _dense_bthd(q, k, v, scale=None):
-    """SDPA over [B, T, H, D], same layout out."""
-    out = F.scaled_dot_product_attention(
-        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), dropout_p=0.0, is_causal=False, scale=scale)
-    return out.transpose(1, 2)
-
 
 class _CondCache:
     """FirstBlockCache state for one cond/uncond stream."""
@@ -134,11 +80,17 @@ class H3Optimizer:
         self._last_sigma = None
 
         # Backend decisions are specific to the full attention workload.
-        self.sparse_resolved = None if sparse_mode == "auto" else (sparse_mode == "enabled")
         self.sparse_failed_reason = None
         self.sparse_calls = 0
         self.dense_calls = 0
         self._gate_done = {}
+        self.native_patch = None
+        if sparse_mode != "disabled" and native_sparse is not None:
+            self.native_patch = native_sparse.SparseAttnPatch(
+                tau=self.sparse_tau, topk_ratio=0.0, vsa=False,
+                sigma_start=float("inf"), sigma_end=0.0, min_tokens=self.sparse_min_video_rows,
+                dense_blocks=set(range(self.sparse_dense_layers)), sink_conditioning="exact_kv_and_rows",
+                extra_tokens=self.sparse_extra_tokens, verbose=verbose)
 
     # ------------------------------------------------------------------ run observation
 
@@ -186,6 +138,8 @@ class H3Optimizer:
         self.fbc_computed_steps = 0
         self.sparse_calls = 0
         self.dense_calls = 0
+        if self.native_patch is not None:
+            self.native_patch.reset()
 
     # ------------------------------------------------------------------ FirstBlockCache
 
@@ -207,11 +161,15 @@ class H3Optimizer:
         pct = self.step_index / max(self.total_steps, 1)
         return self.fbc_start_percent <= pct < self.fbc_end_percent
 
-    def block_patch(self, index):
+    def block_patch(self, index, block=None, previous=None):
         def patch(args, extra):
             img = args["img"]
-            original = extra["original_block"]
             self.layer = index
+            def original(values):
+                if block is not None and self.sparse_window_open(index) and "attention" not in values:
+                    values = {**values, "attention": lambda h, rope_freqs=None, transformer_options={}: self.native_attention(
+                        block.attn, h, rope_freqs, transformer_options, index)}
+                return previous(values, extra) if previous is not None else extra["original_block"](values)
             if not self.fbc_enabled:
                 return original(args)
             cache = self.caches.setdefault(self.cond_key, _CondCache())
@@ -270,145 +228,84 @@ class H3Optimizer:
                          f"{self.fbc_skipped_steps + self.fbc_computed_steps} block-stack evaluations, "
                          f"{self.sparse_calls} sparse / {self.dense_calls} dense attention calls")
 
-    # ------------------------------------------------------------------ sparse attention
+    # ------------------------------------------------------------------ native sparse attention
 
-    def _sparse_eligible(self, q, heads, kwargs):
-        if self.sparse_mode == "disabled":
+    def sparse_window_open(self, index):
+        if self.sparse_mode == "disabled" or self.native_patch is None:
             return False
-        if not kwargs.get("skip_reshape", False) or kwargs.get("mask") is not None:
-            return False
-        if q.device.type != "cuda" or q.dtype not in (torch.bfloat16, torch.float16):
-            return False
-        if q.ndim != 4 or q.shape[0] != 1 or q.shape[1] != heads or q.shape[-1] != 128:
-            return False
-        if self.seq_len is None or self.video_start is None or q.shape[2] != self.seq_len:
-            return False
-        if not (0 < self.video_start < self.seq_len):
-            return False
-        if (self.seq_len - self.video_start) < self.sparse_min_video_rows:
-            return False
-        if self.layer < self.sparse_dense_layers:
-            return False
-        if self.step_index < math.ceil(self.sparse_dense_steps_pct * max(self.total_steps, 1)):
-            return False
-        if self.step_index >= self.total_steps - self.sparse_dense_last_steps:
-            return False
-        return True
+        return (index >= self.sparse_dense_layers
+                and self.step_index >= math.ceil(self.sparse_dense_steps_pct * max(self.total_steps, 1))
+                and self.step_index < self.total_steps - self.sparse_dense_last_steps)
 
-    def _sparse_key(self, q, k, v, kwargs):
-        return (q.device, q.dtype, tuple(q.shape), q.stride(), k.stride(), v.stride(),
-                self.video_start, kwargs.get("scale"), self.sparse_backend,
-                self.sparse_tau, self.sparse_extra_tokens)
+    def _native_key(self, attn, h, transformer_options):
+        layout = transformer_options.get("minimax_h3_layout")
+        prefix = self.video_start if layout is not None else None
+        return (h.device, h.dtype, tuple(h.shape), h.stride(), attn.heads, attn.head_dim,
+                prefix, self.sparse_tau, self.sparse_extra_tokens)
 
-    def _run_sparse(self, backend, q, k, v, *, tau, scale=None, prefix=0):
-        qb, kb, vb = (x.transpose(1, 2) for x in (q, k, v))
-        if backend == "comfy_kitchen":
-            # Kitchen accepts H3's strided fused-QKV views without full-size copies.
-            sinks = [0, (prefix + 63) // 64]
-            out = ck.sol_attn(qb, kb, vb, tau=tau, scale=scale, sink_blocks=sinks,
-                              sink_q=sinks, token_aug=self.sparse_extra_tokens)
-        else:
-            sol_attn = _load_sol_attn()
-            if sol_attn is None:
-                raise RuntimeError(_SOL_ATTN_ERROR or "sol_attn import failed")
-            out = sol_attn(*(x.to(torch.bfloat16).contiguous() for x in (qb, kb, vb)),
-                           tau=tau, scale=scale, thresh_type="diag", sink_start=0, sink_tokens=prefix)
-            out = out.to(q.dtype)
-        if prefix:
-            # Preserve full-precision conditioning queries even with INT8 exact kernels.
-            out[:, :prefix] = _dense_bthd(qb[:, :prefix], kb, vb, scale=scale)
-        return out
+    def _gate_native(self, dense, sparse, device):
+        """Time the complete projected attention, including the native producer.
 
-    def _gate_and_bench(self, q, k, v, kwargs, incumbent):
-        """Verify numerics, then time the full path including copies and dense prefix.
-
-        Losing/unavailable backends affect only this workload. This first-call work
-        runs outside ComfyUI's allocation graph; steady-state attention stays inside.
+        This is a speed/finite-output gate, not a promise of lossless sparsity.
+        The error printed here is after output projection on sampled token rows.
+        Numerical validation against SDPA belongs to the reproducible audit.
         """
-        backends = []
-        if self.sparse_backend in ("auto", "comfy_kitchen"):
-            available = getattr(ck, "sol_attn_is_available", None)
-            if available is not None and available(q.device):
-                backends.append("comfy_kitchen")
-        if self.sparse_backend in ("auto", "vendored"):
-            backends.append("vendored")
-        scale = kwargs.get("scale")
-
-        def timeit(fn, n=5):
-            fn()
-            torch.cuda.synchronize(q.device)
-            t0 = time.perf_counter()
-            for _ in range(n):
-                fn()
-            torch.cuda.synchronize(q.device)
-            return (time.perf_counter() - t0) / n
-
-        t_incumbent = timeit(incumbent)
-        fastest, best_time = None, float("inf")
-        for backend in backends:
-            try:
-                got = self._run_sparse(backend, q, k, v, tau=-1000.0, scale=scale)
-                want = _dense_bthd(*(x.transpose(1, 2) for x in (q, k, v)), scale=scale)
-                rel = (torch.linalg.vector_norm(got.float() - want.float()) /
-                       torch.linalg.vector_norm(want.float()).clamp_min(1e-12)).item()
-                del got, want
-                if not math.isfinite(rel) or rel > 0.02:
-                    raise RuntimeError(f"route-all rel_l2 {rel:.5f} exceeds 0.02 or is nonfinite")
-                run = lambda: self._run_sparse(backend, q, k, v, tau=self.sparse_tau,
-                                                scale=scale, prefix=self.video_start)
-                out = run()
-                finite = bool(torch.isfinite(out).all())
+        want = dense()
+        got = sparse()
+        finite = bool(torch.isfinite(got).all())
+        if not finite:
+            raise RuntimeError("native SOL output contains NaN/Inf")
+        stride = max(1, got.shape[0] // 256)
+        a, b = got[::stride].float(), want[::stride].float()
+        rel = (torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b).clamp_min(1e-12)).item()
+        del got, want, a, b
+        times = []
+        for fn in (dense, sparse):
+            samples = []
+            for _ in range(3):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                out = fn()
+                end.record()
+                end.synchronize()
+                samples.append(start.elapsed_time(end))
                 del out
-                if not finite:
-                    raise RuntimeError("sparse output is nonfinite")
-                elapsed = timeit(run)
-                speedup = t_incumbent / max(elapsed, 1e-9)
-                logging.info(f"[MiniMaxH3Speed] {backend} gate: rel_l2 {rel:.5f}, "
-                             f"complete sparse {elapsed * 1000:.2f} ms vs dense "
-                             f"{t_incumbent * 1000:.2f} ms ({speedup:.2f}x)")
-                if elapsed < best_time and (self.sparse_mode == "enabled" or speedup >= 1.05):
-                    fastest, best_time = backend, elapsed
-            except Exception as exc:  # Optional kernels may not compile on this GPU/runtime.
-                logging.warning(f"[MiniMaxH3Speed] {backend} unavailable for this workload: "
-                                f"{type(exc).__name__}: {exc}")
-        self.sparse_resolved = fastest is not None
-        logging.info(f"[MiniMaxH3Speed] attention selected: {fastest or 'incumbent dense'} "
-                     f"on {torch.cuda.get_device_name(q.device)}, {q.shape[2]} tokens")
-        return fastest
+            times.append(sorted(samples)[1])
+        speedup = times[0] / max(times[1], 1e-9)
+        selected = speedup >= 1.05
+        logging.info("[MiniMaxH3Speed] native complete attention: %.2f ms sparse / %.2f ms dense (%.2fx), "
+                     "sampled projected rel_l2 %.5f; selected %s", times[1], times[0], speedup, rel,
+                     "native SOL" if selected else "dense")
+        return selected
 
-    def attention_override(self, func, q, k, v, heads, **kwargs):
-        try:
-            if self._sparse_eligible(q, heads, kwargs):
-                if q.shape == k.shape == v.shape and q.dtype == k.dtype == v.dtype:
-                    return self._sparse_attention(func, q, k, v, heads, kwargs)
-        except Exception as e:  # noqa: BLE001 - never let the sparse path break sampling
-            self.sparse_failed_reason = f"{type(e).__name__}: {e}"
-            self._gate_done[self._sparse_key(q, k, v, kwargs)] = None
-            logging.warning(f"[MiniMaxH3Speed] sparse attention failed, using dense for this workload: "
-                            f"{self.sparse_failed_reason}")
-        self.dense_calls += 1
-        return func(q, k, v, heads, **kwargs)
-
-    def _sparse_attention(self, func, q, k, v, heads, kwargs):
-        key = self._sparse_key(q, k, v, kwargs)
-        if key not in self._gate_done:
-            with pause_malloc_graph():
-                self._gate_done[key] = self._gate_and_bench(
-                    q, k, v, kwargs, incumbent=lambda: func(q, k, v, heads, **kwargs))
-        backend = self._gate_done[key]
-        if backend is None:
+    def native_attention(self, attn, h, rope_freqs, transformer_options, index):
+        dense = lambda: attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
+        if not native_sparse.h3_eligible(attn, h, rope_freqs, transformer_options, self.native_patch, index):
             self.dense_calls += 1
-            return func(q, k, v, heads, **kwargs)
-        out = self._run_sparse(backend, q, k, v, tau=self.sparse_tau,
-                               scale=kwargs.get("scale"), prefix=self.video_start)
-        self.sparse_calls += 1
-        if kwargs.get("skip_output_reshape", False):
-            return out.transpose(1, 2)
-        return out.reshape(1, out.shape[1], heads * 128)
+            return dense()
+        key = self._native_key(attn, h, transformer_options)
+        sparse = lambda: native_sparse.h3_sparse_attention(attn, h, rope_freqs, transformer_options, self.native_patch, index)
+        try:
+            if key not in self._gate_done:
+                if self.sparse_mode == "enabled":
+                    self._gate_done[key] = True
+                else:
+                    with pause_malloc_graph():
+                        self._gate_done[key] = self._gate_native(dense, sparse, h.device)
+            if self._gate_done[key]:
+                out = sparse()
+                self.sparse_calls += 1
+                return out
+        except (RuntimeError, NotImplementedError) as exc:
+            self._gate_done[key] = False
+            self.sparse_failed_reason = f"{type(exc).__name__}: {exc}"
+            logging.warning("[MiniMaxH3Speed] native SOL unavailable for this shape, using dense: %s", self.sparse_failed_reason)
+        self.dense_calls += 1
+        return dense()
 
 
 class MiniMaxH3SpeedOptimizer:
-    """Apply the NVlabs Sana sol-engine MiniMax H3 acceleration line to a loaded H3 model."""
+    """Apply native sparse attention and optional FirstBlockCache to a loaded H3 model."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -416,27 +313,27 @@ class MiniMaxH3SpeedOptimizer:
             "required": {
                 "model": ("MODEL", {"tooltip": "A MiniMax H3 diffusion model."}),
                 "first_block_cache": ("BOOLEAN", {"default": True, "tooltip": "Skip the transformer tail when block 0's residual barely moved since the previous step (FirstBlockCache). The dominant speedup of the reference line."}),
-                "fbc_threshold": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.005, "tooltip": "Accumulated relative block-0 residual change below which steps are skipped. 0.08 is the NVlabs-advertised near-lossless policy; raise toward 0.15-0.20 for more speed at some quality cost."}),
+                "fbc_threshold": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.005, "tooltip": "Accumulated relative block-0 residual change below which steps are skipped. 0.08 is the conservative default. Cache reuse is approximate; higher values can change the result more."}),
                 "fbc_start_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Never skip before this fraction of the schedule (early steps set global structure)."}),
                 "fbc_end_percent": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Never skip after this fraction of the schedule (final steps set fine detail)."}),
                 "fbc_max_consecutive": ("INT", {"default": 3, "min": 1, "max": 50, "tooltip": "Cap on consecutive skipped steps."}),
-                "sparse_attention": (["auto", "enabled", "disabled"], {"default": "auto", "tooltip": "Sol-Attn sparse attention over the packed sequence. 'auto' verifies correctness and benchmarks against your current attention backend on this GPU, and keeps whichever is faster."}),
+                "sparse_attention": (["auto", "enabled", "disabled"], {"default": "auto", "tooltip": "ComfyUI's native SOL attention, including its chunked H3 producer. Auto times complete projected attention and requires a 5% speed win; enabled skips that benchmark; disabled preserves dense attention. Sparse output is approximate."}),
                 "sparse_dense_steps_pct": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of early steps that always run dense attention (reference: 10 of 50)."}),
                 "sparse_dense_layers": ("INT", {"default": 2, "min": 0, "max": 50, "tooltip": "First N transformer blocks always run dense attention (reference: 2)."}),
             },
             "optional": {
                 "sparse_tau": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 100.0, "step": 0.1, "tooltip": "Sol-Attn routing threshold temperature. 1.0 is the released H3 policy; higher keeps fewer KV blocks."}),
-                "sparse_min_video_rows": ("INT", {"default": 4096, "min": 0, "max": 1000000, "tooltip": "Skip sparse attention when the target-video sequence is shorter than this (short sequences gain nothing)."}),
+                "sparse_min_video_rows": ("INT", {"default": 4096, "min": 0, "max": 1000000, "tooltip": "Minimum packed H3 token count for native sparse eligibility. Short sequences often gain little."}),
                 "fbc_cache_device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Where cached residuals live. 'cpu' saves VRAM at some transfer cost."}),
                 "verbose": ("BOOLEAN", {"default": True}),
                 "enable_speedup": ("BOOLEAN", {
                     "default": True,
                     "label_on": "ENABLED",
                     "label_off": "DISABLED (normal)",
-                    "tooltip": "Master switch for the complete 4x preset path. Disable it to pass through the original model and disable the linked MiniMax H3 VAE Speedup.",
+                    "tooltip": "Master switch for H3 optimizations. Disable it to pass through the original model and disable the linked MiniMax H3 VAE Speedup. Speed depends on the workload, GPU and selected controls.",
                 }),
-                "sparse_backend": (["auto", "comfy_kitchen", "vendored"], {"default": "auto", "tooltip": "Auto compares native Comfy Kitchen SOL with the bundled CuTe/Triton kernel. Only verified, faster paths are used in auto attention mode."}),
-                "sparse_extra_tokens": ("INT", {"default": 256, "min": 0, "max": 256, "step": 64, "tooltip": "Comfy Kitchen: extra tokens attended outside routed blocks. 256 reduces sparse approximation and brightness/detail pulsing; 0 is faster. Requires comfy-kitchen >=0.2.33."}),
+                "sparse_backend": (["auto", "comfy_kitchen", "vendored", "native"], {"default": "native", "tooltip": "Native ComfyUI/Comfy Kitchen only. Older saved auto, comfy_kitchen and vendored values are accepted as aliases so workflows keep loading; the duplicate bundled kernels have been retired."}),
+                "sparse_extra_tokens": ("INT", {"default": 256, "min": 0, "max": 256, "step": 64, "tooltip": "Comfy Kitchen: extra tokens attended outside routed blocks. 256 reduces sparse approximation and brightness/detail pulsing; 0 is faster. Requires current ComfyUI and comfy-kitchen >=0.2.37."}),
                 "sparse_dense_last_steps": ("INT", {"default": 1, "min": 0, "max": 50, "tooltip": "Final steps use dense attention and recompute the block stack to protect fine detail. 0 keeps the original sparse schedule; the final block stack still always computes."}),
             },
         }
@@ -446,8 +343,8 @@ class MiniMaxH3SpeedOptimizer:
     FUNCTION = "apply"
     CATEGORY = "TeaCache/MiniMaxH3"
     TITLE = "MiniMax H3 Speed Optimizer"
-    DESCRIPTION = ("4x-line MiniMax H3 acceleration from NVlabs Sana sol-engine: FirstBlockCache step "
-                   "skipping plus Sol-Attn sparse attention with per-GPU auto-verification. "
+    DESCRIPTION = ("Optional FirstBlockCache and ComfyUI's native SOL sparse attention. "
+                   "Auto benchmarks the complete native attention path against the model's dense backend. "
                    "The master switch can also drive the paired VAE speedup node. "
                    "Techniques that don't work or don't win on your GPU fall back to the normal path automatically.")
 
@@ -495,6 +392,8 @@ class MiniMaxH3SpeedOptimizer:
                              "Connect the MiniMax H3 diffusion model (e.g. minimax_h3_fl2va / ref2va).")
         if not first_block_cache and sparse_attention == "disabled":
             return (model, True)
+        if sparse_attention != "disabled" and native_sparse is None:
+            logging.warning("[MiniMaxH3Speed] native sparse attention is unavailable: update ComfyUI. Using dense attention.")
 
         m = model.clone()
         opt = H3Optimizer(
@@ -523,21 +422,12 @@ class MiniMaxH3SpeedOptimizer:
 
         m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
                                "minimax_h3_speed", wrapper)
-        for i in range(opt.num_blocks):
-            m.set_model_patch_replace(opt.block_patch(i), "dit", "double_block", i)
+        replacements = m.model_options.get("transformer_options", {}).get("patches_replace", {}).get("dit", {})
+        for i, block in enumerate(diffusion_model.blocks):
+            previous = replacements.get(("double_block", i))
+            m.set_model_patch_replace(opt.block_patch(i, block, previous), "dit", "double_block", i)
 
-        if sparse_attention != "disabled":
-            to = m.model_options.setdefault("transformer_options", {})
-            previous = to.get("optimized_attention_override")
-
-            if previous is None:
-                to["optimized_attention_override"] = opt.attention_override
-            else:
-                def chained(func, *args, **kw):
-                    def inner(q, k, v, heads, **kw2):
-                        return previous(func, q, k, v, heads, **kw2)
-                    return opt.attention_override(inner, *args, **kw)
-                to["optimized_attention_override"] = chained
+        m.add_callback_with_key(comfy.patcher_extension.CallbacksMP.ON_CLEANUP, "minimax_h3_speed", lambda patcher: opt.reset_run())
 
         m.model_options["minimax_h3_speed_optimizer"] = opt
         return (m, True)

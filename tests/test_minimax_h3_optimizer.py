@@ -21,7 +21,11 @@ def load_optimizer():
         setattr(comfy, name, module)
         modules[f"comfy.{name}"] = module
     comfy.model_prefetch.pause_malloc_graph = contextlib.nullcontext
-    modules["comfy_kitchen"] = types.ModuleType("comfy_kitchen")
+    native = types.SimpleNamespace(SparseAttnPatch=lambda **kwargs: types.SimpleNamespace(reset=lambda: None),
+                                   h3_eligible=lambda *args: True, h3_sparse_attention=mock.Mock())
+    extras = types.ModuleType("comfy_extras")
+    extras.nodes_sparse_attention = native
+    modules["comfy_extras"] = extras
     spec = importlib.util.spec_from_file_location("optimizer_under_test", ROOT / "minimax_h3/optimizer.py")
     module = importlib.util.module_from_spec(spec)
     with mock.patch.dict(sys.modules, modules):
@@ -56,81 +60,55 @@ class OptimizerTests(unittest.TestCase):
 
     def test_dense_schedule_applies_to_sparse_attention_and_cache(self):
         opt = self.make_optimizer(sparse_dense_last_steps=2)
-        q = types.SimpleNamespace(device=torch.device("cuda:0"), dtype=torch.bfloat16,
-                                  ndim=4, shape=(1, 4, 257, 128))
         for step, expected in ((0, False), (1, False), (2, True), (5, True), (6, False), (7, False)):
             opt.step_index = step
-            self.assertEqual(opt._sparse_eligible(q, 4, {"skip_reshape": True}), expected)
+            self.assertEqual(opt.sparse_window_open(4), expected)
         self.assertFalse(opt.fbc_window_open())
-
-    def test_native_views_scale_tokens_and_exact_prefix(self):
-        opt = self.make_optimizer()
-        packed = torch.randn(1, 257, 3, 4, 128, dtype=torch.float16)
-        qb, kb, vb = packed.unbind(2)
-        q, k, v = (x.transpose(1, 2) for x in (qb, kb, vb))
-        native = mock.Mock(return_value=torch.zeros_like(qb))
-        with mock.patch.object(self.module, "ck", types.SimpleNamespace(sol_attn=native)):
-            out = opt._run_sparse("comfy_kitchen", q, k, v, tau=1, scale=0.25, prefix=65)
-        args, kwargs = native.call_args
-        for before, after in zip((qb, kb, vb), args):
-            self.assertEqual(before.data_ptr(), after.data_ptr())
-            self.assertEqual(before.stride(), after.stride())
-        self.assertEqual(kwargs, dict(tau=1, scale=0.25, sink_blocks=[0, 2], sink_q=[0, 2], token_aug=256))
-        self.assertTrue(torch.equal(out[:, :65], self.module._dense_bthd(qb[:, :65], kb, vb, scale=0.25)))
-        self.assertEqual(out.dtype, torch.float16)
-        self.assertEqual(out[:, 65:].count_nonzero(), 0)
+        opt.step_index = 2
+        self.assertFalse(opt.sparse_window_open(1))
 
     def test_rejected_shape_does_not_disable_other_shapes(self):
         opt = self.make_optimizer()
-        q = torch.zeros(1, 4, 257, 128)
-        incumbent = mock.Mock(return_value="dense")
-        with mock.patch.object(opt, "_gate_and_bench", return_value=None) as gate:
+        attn = mock.Mock(return_value="dense", heads=4, head_dim=128)
+        h = torch.zeros(257, 512)
+        with mock.patch.object(opt, "_gate_native", return_value=False) as gate:
             for _ in range(2):
-                self.assertEqual(opt._sparse_attention(incumbent, q, q, q, 4, {}), "dense")
+                self.assertEqual(opt.native_attention(attn, h, None, {}, 4), "dense")
             self.assertEqual(gate.call_count, 1)
-            q2 = q[:, :, :193]
-            opt._sparse_attention(incumbent, q2, q2, q2, 4, {})
+            opt.native_attention(attn, h[:193], None, {}, 4)
             self.assertEqual(gate.call_count, 2)
 
-    def test_cache_key_includes_heads_prefix_dtype_scale_and_token_budget(self):
+    def test_native_cache_key_includes_shape_dtype_prefix_and_token_budget(self):
         opt = self.make_optimizer()
-        q = torch.zeros(1, 4, 257, 128)
-        base = opt._sparse_key(q, q, q, {})
-        self.assertNotEqual(base, opt._sparse_key(q[:, :2], q[:, :2], q[:, :2], {}))
-        self.assertNotEqual(base, opt._sparse_key(q.half(), q.half(), q.half(), {}))
-        self.assertNotEqual(base, opt._sparse_key(q, q, q, {"scale": 0.25}))
+        attn = types.SimpleNamespace(heads=4, head_dim=128)
+        h = torch.zeros(257, 512)
+        options = {"minimax_h3_layout": object()}
+        base = opt._native_key(attn, h, options)
+        self.assertNotEqual(base, opt._native_key(attn, h[:193], options))
+        self.assertNotEqual(base, opt._native_key(attn, h.half(), options))
         opt.video_start += 64
-        self.assertNotEqual(base, opt._sparse_key(q, q, q, {}))
+        self.assertNotEqual(base, opt._native_key(attn, h, options))
         opt.video_start -= 64
         opt.sparse_extra_tokens = 0
-        self.assertNotEqual(base, opt._sparse_key(q, q, q, {}))
+        self.assertNotEqual(base, opt._native_key(attn, h, options))
 
-    def test_native_nan_gate_tries_verified_vendor(self):
+    def test_failed_native_shape_falls_back_once(self):
         opt = self.make_optimizer(sparse_mode="enabled")
-        q = torch.zeros(1, 4, 257, 128)
-        out = torch.ones(1, 257, 4, 128)
+        attn = mock.Mock(return_value="dense", heads=4, head_dim=128)
+        h = torch.zeros(257, 512)
+        with mock.patch.object(self.module.native_sparse, "h3_sparse_attention", side_effect=RuntimeError("unsupported")) as sparse:
+            for _ in range(2):
+                self.assertEqual(opt.native_attention(attn, h, None, {}, 4), "dense")
+            self.assertEqual(sparse.call_count, 1)
+        self.assertIn("unsupported", opt.sparse_failed_reason)
 
-        def run(backend, *args, **kwargs):
-            return torch.full_like(out, float("nan")) if backend == "comfy_kitchen" else out
-
-        kitchen = types.SimpleNamespace(sol_attn_is_available=lambda device: True)
-        with mock.patch.object(self.module, "ck", kitchen), \
-                mock.patch.object(opt, "_run_sparse", side_effect=run), \
-                mock.patch.object(self.module, "_dense_bthd", return_value=out), \
-                mock.patch.object(torch.cuda, "synchronize"), \
-                mock.patch.object(torch.cuda, "get_device_name", return_value="test GPU"):
-            self.assertEqual(opt._gate_and_bench(q, q, q, {}, lambda: out), "vendored")
-
-    def test_head_layout_is_preserved(self):
-        opt = self.make_optimizer()
-        q = torch.zeros(1, 4, 257, 128)
-        out = torch.arange(q.numel()).reshape(1, 257, 4, 128)
-        opt._gate_done[opt._sparse_key(q, q, q, {})] = "comfy_kitchen"
-        with mock.patch.object(opt, "_run_sparse", return_value=out):
-            flat = opt._sparse_attention(None, q, q, q, 4, {})
-            heads = opt._sparse_attention(None, q, q, q, 4, {"skip_output_reshape": True})
-        self.assertTrue(torch.equal(flat, out.reshape(1, 257, 512)))
-        self.assertTrue(torch.equal(heads, out.transpose(1, 2)))
+    def test_existing_block_patch_composes_with_cache(self):
+        opt = self.make_optimizer(fbc_enabled=True, sparse_mode="disabled")
+        previous = mock.Mock(side_effect=lambda args, extra: {"img": args["img"] + 7})
+        original = mock.Mock(side_effect=AssertionError("existing patch was bypassed"))
+        out = opt.block_patch(0, previous=previous)({"img": torch.zeros(2, 4)}, {"original_block": original})
+        self.assertTrue(torch.equal(out["img"], torch.full((2, 4), 7)))
+        previous.assert_called_once()
 
     def test_new_widgets_are_appended_after_legacy_master_switch(self):
         names = list(self.module.MiniMaxH3SpeedOptimizer.INPUT_TYPES()["optional"])

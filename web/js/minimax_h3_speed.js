@@ -86,7 +86,7 @@ function loadValuesInBackendOrder(node, data) {
     // restore them in backend order: one slot of rotation per reload, which cannot be undone.
     if (!values) {
         console.warn(`[MiniMaxH3Speed] node ${node.id}: saved widget values were scrambled by an older `
-            + "version of this extension. They were reset to the defaults with the 4x speedup off; "
+            + "version of this extension. They were reset to the defaults with H3 optimizations off; "
             + "reload the preset to get its tuned values back.");
     }
 }
@@ -153,7 +153,7 @@ function installMasterSwitch(node) {
         return;
     }
 
-    widget.label = "4x speedup";
+    widget.label = "H3 optimizations";
     if (!widget[CALLBACK_INSTALLED]) {
         widget[CALLBACK_INSTALLED] = true;
         const originalCallback = widget.callback;

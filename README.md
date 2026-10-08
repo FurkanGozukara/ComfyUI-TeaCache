@@ -5,46 +5,31 @@ Timestep Embedding Aware Cache ([TeaCache](https://github.com/ali-vilab/TeaCache
 
 TeaCache has now been integrated into ComfyUI and is compatible with the ComfyUI native nodes. ComfyUI-TeaCache is easy to use, simply connect the TeaCache node with the ComfyUI native nodes for seamless usage.
 
-## MiniMax H3 Speed Optimizer (NVlabs Sana sol-engine port)
+## MiniMax H3 Speed Optimizer
 
-This package also ships a dedicated acceleration suite for the **MiniMax H3** 33B audio-video
-Omni-DiT, ported from the [NVlabs Sana `sol-engine`](https://github.com/NVlabs/Sana/tree/sol-engine/models/minimax_h3/optimized)
-reference (whose measured full line is 3.97x on the denoise+decode hot path):
+The existing controls now call **ComfyUI's native H3 sparse attention producer**.
+The duplicate bundled SOL kernels have been retired. Update ComfyUI and
+`comfy-kitchen>=0.2.37` before using sparse attention.
 
-- **`MiniMax H3 Speed Optimizer`** (`MODEL -> MODEL, BOOLEAN`): place between the `UNETLoader` and the
-  guider/sampler.
-  - *Master switch*: `enable_speedup=false` returns the original model without installing any
-    denoiser patches. Connect its `speedup_enabled` output to the matching input on
-    `MiniMax H3 VAE Speedup` to make one switch restore the complete non-4x path.
-  - *FirstBlockCache*: transformer block 0 runs every step; when its output residual barely
-    moved since the previous step, the remaining 49 blocks are skipped and the cached tail
-    residual is reused (the reference's dominant 2.58x stage). Threshold, schedule window,
-    and a consecutive-skip cap are exposed.
-  - *Sol-Attn sparse attention*: the packed `[text | cond | audio | video]` self-attention is
-    routed sparsely with the whole prefix as an exact KV sink and prefix query rows recomputed
-    densely (`tau=1.0`, first 20% of steps and first 2 blocks dense). `sparse_backend=auto`
-    compares native **Comfy Kitchen SOL** with the bundled CuTe/Triton kernel. Kitchen uses
-    H3's strided QKV views directly, avoiding three full-size copies, and defaults to **256
-    extra routed tokens** to reduce sparse approximation and brightness/detail pulsing.
-    This uses the upstream [token-routing improvement](https://github.com/Comfy-Org/comfy-kitchen/pull/156)
-    in `comfy-kitchen>=0.2.33`. Prefix queries retain full-precision SDPA in both backends.
-    The bundled backend remains available on NVIDIA SM80+; specialized CuTe kernels are used
-    where supported, otherwise Triton.
-  - *Final detail step*: `sparse_dense_last_steps=1` keeps the final denoising step dense and
-    recomputes the block stack. Set it to `0` for the original sparse schedule. FirstBlockCache
-    always computes the final step, including 4/8-step schedules.
-  - *Per-workload verification*: each candidate's all-block attention must pass a finite,
-    relative-L2 check against SDPA on the model's tensors. Auto mode times the **complete**
-    sparse path, including conversions and dense prefix queries, and requires a 5% gain over
-    the current attention backend. Decisions include device, dtype, head count, sequence
-    layout, prefix, scale and token budget. A failure or slowdown for one workload does not
-    disable acceleration for other workloads. Startup verification runs outside ComfyUI's
-    allocation compiler; normal model computation remains compiled.
+- **Master switch:** `enable_speedup=false` returns the original model. Its Boolean
+  output can also control the paired VAE node.
+- **SOL:** `sparse_attention=auto` benchmarks the complete native attention path
+  against dense attention and requires a 5% win. `enabled` skips that benchmark;
+  `disabled` uses dense attention. Unsupported workloads fall back to dense.
+- **Quality controls:** the default first 20% of steps, first two blocks and last
+  step stay dense. SOL uses tau 1.0, 256 extra tokens, and native exact KV/query
+  sinks for conditioning. Sparse attention is approximate, not lossless.
+- **FirstBlockCache:** remains independently switchable, with threshold and skip
+  limits. It always computes the last step and now composes pre-existing native
+  block patches, including SLA, instead of replacing them.
+- **Compatibility:** existing node names, widget positions and saved backend values
+  still load. Old `auto`, `comfy_kitchen` and `vendored` backend selections all route
+  to native ComfyUI. No bundled-kernel fallback is kept.
 
-Existing workflows need no rewiring: the three new controls are appended after the original
-widgets. Restart ComfyUI after updating this node and its requirements. The `4x` name describes
-the original reference acceleration stack, not a promised speedup on every GPU or step count.
-See [SOL update validation](docs/sol_attention_update.md) for measured results and limits.
+The auto benchmark checks finite output and reports sampled output-projection
+error; it is not a claim of dense-equivalent quality. Speed depends on token
+count, GPU, step schedule, conditioning, and model. There is no universal 4x gain.
+See [SOL update validation](docs/sol_attention_update.md) for dated measurements.
 
 - **`MiniMax H3 VAE Speedup`** (`VAE -> VAE`): place after the video `VAELoader`. Feeds the
   identical-shape spatial decode tiles through the ViT decoder as one batch instead of one
@@ -58,8 +43,7 @@ See [SOL update validation](docs/sol_attention_update.md) for measured results a
 Notes: the AdaLN-precompute stage of the reference line is already baked into ComfyUI's H3
 checkpoints (`adaln_t_table` curve basis), and ComfyUI core already fuses QKV projection,
 RMSNorm+partial-RoPE and SwiGLU via comfy-kitchen, so those stages are not duplicated here.
-The first eligible workload pays backend verification/benchmarking and any bundled-kernel
-compilation; subsequent matching calls reuse the decision.
+The first eligible workload pays native compilation and optional benchmarking; subsequent matching calls reuse the decision.
 
 ## MiniMax H3 Face Inpaint (YOLO face refinement)
 
