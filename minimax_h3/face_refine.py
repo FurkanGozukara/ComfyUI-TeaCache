@@ -18,6 +18,7 @@ https://github.com/Carasibana/ComfyUI-H3-FaceRefine) for the SECourses MiniMax H
 from __future__ import annotations
 
 import os
+import zipfile
 
 import numpy as np
 import torch
@@ -203,13 +204,59 @@ def _load_detector(name: str):
 
 _REC_CACHE: dict = {}
 
+# buffalo_l file of each InsightFace task these nodes load.
+_BUFFALO_FILES = {"detection": "det_10g.onnx", "recognition": "w600k_r50.onnx", "landmark_2d_106": "2d106det.onnx"}
+
+
+def _insightface_roots() -> list:
+    """InsightFace folders: ComfyUI's own models/insightface, every registered insightface folder, then the
+    insightface folders next to the configured model roots (Swarm's shared Models folder, extra_model_paths.yaml),
+    the same places the CodeFormer mouth pass searches."""
+    roots = [os.path.join(getattr(folder_paths, "models_dir", "models"), "insightface")]
+    for key in ("insightface", "diffusion_models", "checkpoints"):
+        try:
+            paths = folder_paths.get_folder_paths(key)
+        except Exception:
+            continue
+        roots += paths if key == "insightface" else [os.path.join(os.path.dirname(p), "insightface") for p in paths]
+    unique, seen = [], set()
+    for root in roots:
+        norm = os.path.normcase(os.path.abspath(root))
+        if norm not in seen:
+            seen.add(norm)
+            unique.append(root)
+    return unique
+
+
+def _insightface_root(pack: str, modules) -> str:
+    """First InsightFace folder whose models/<pack> holds the files of `modules`. Without one, ComfyUI's own folder
+    is used: InsightFace downloads a missing pack there. An existing but incomplete pack folder blocked that download
+    (InsightFace downloads only packs whose folder does not exist), so it is refilled from the archive InsightFace
+    kept next to it, or downloaded again."""
+    roots = _insightface_roots()
+    files = [_BUFFALO_FILES[m] for m in modules] if pack == "buffalo_l" else []
+    for root in roots:
+        if files and all(os.path.isfile(os.path.join(root, "models", pack, f)) for f in files):
+            return root
+    root = roots[0]
+    folder = os.path.join(root, "models", pack)
+    if files and os.path.isdir(folder):
+        if zipfile.is_zipfile(folder + ".zip"):
+            with zipfile.ZipFile(folder + ".zip") as archive:
+                archive.extractall(folder)
+        if not all(os.path.isfile(os.path.join(folder, f)) for f in files):
+            from insightface.utils import storage
+
+            storage.download("models", pack, force=True, root=root)
+    return root
+
 
 def _face_recogniser(pack: str = "buffalo_l"):
     if pack in _REC_CACHE:
         return _REC_CACHE[pack]
     import insightface
 
-    root = os.path.join(getattr(folder_paths, "models_dir", "models"), "insightface")
+    root = _insightface_root(pack, ("detection", "recognition"))
     app = insightface.app.FaceAnalysis(
         name=pack, root=root, allowed_modules=["detection", "recognition"],
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
@@ -225,7 +272,7 @@ def _face_landmark_detector(pack: str = "buffalo_l"):
         return _REC_CACHE[key]
     import insightface
 
-    root = os.path.join(getattr(folder_paths, "models_dir", "models"), "insightface")
+    root = _insightface_root(pack, ("detection", "landmark_2d_106"))
     app = insightface.app.FaceAnalysis(
         name=pack, root=root, allowed_modules=["detection", "landmark_2d_106"],
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
