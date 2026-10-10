@@ -433,9 +433,13 @@ class MiniMaxH3SpeedOptimizer:
         return (m, True)
 
 
-def _batched_tiled_decode(self, z, batch_size_resolver):
+def _batched_tiled_decode(self, z, batch_size_resolver, frames=slice(None)):
     """Batched drop-in for MiniMaxH3VideoVAE.tiled_decode: same tiles, same blend, same canvas,
-    but the (identical-shape) tile decodes run through the ViT decoder as batches."""
+    but the (identical-shape) tile decodes run through the ViT decoder as batches.
+
+    `frames` follows ComfyUI's tiled_decode(z, frames) (comfy ec1537d, October 10, 2026): each decoded
+    tile keeps only those output frames before blending, as the native decode does; older cores call
+    without it and keep every frame."""
     height, width = z.shape[-2] * self.vae_ratio, z.shape[-1] * self.vae_ratio
     y_idx, y_len, y_overlap = self.split_tiles(height)
     x_idx, x_len, x_overlap = self.split_tiles(width)
@@ -463,7 +467,7 @@ def _batched_tiled_decode(self, z, batch_size_resolver):
             torch.cuda.empty_cache()
             batch = 1
             continue
-        tiles.extend(decoded.split(1, dim=0))
+        tiles.extend(t[:, :, frames] for t in decoded.split(1, dim=0))
         start += len(chunk)
 
     canvas = None
@@ -561,7 +565,7 @@ class MiniMaxH3VAESpeedup:
             return measured[key]
 
         fsm.tiled_decode = types.MethodType(
-            lambda self, z: _batched_tiled_decode(self, z, batch_size_resolver), fsm)
+            lambda self, z, frames=slice(None): _batched_tiled_decode(self, z, batch_size_resolver, frames), fsm)
 
         # Ask ComfyUI's memory planner for the extra headroom the batched decode wants, so
         # DynamicVRAM evicts enough staged weight pages *before* the decode instead of the
