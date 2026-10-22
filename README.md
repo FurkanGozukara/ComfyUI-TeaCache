@@ -16,6 +16,12 @@ The duplicate bundled SOL kernels have been retired. Update ComfyUI and
 - **SOL:** `sparse_attention=auto` benchmarks the complete native attention path
   against dense attention and requires a 5% win. `enabled` skips that benchmark;
   `disabled` uses dense attention. Unsupported workloads fall back to dense.
+- **VSA (FastH3):** `sparse_attention=vsa` runs the Video Sparse Attention FastH3
+  models such as FastH3 Omni were trained with: ComfyUI's native VSA tiles keep 10%
+  of the video cubes plus the learned coarse branch in every step and block, with no
+  benchmark. Models without that branch (plain MiniMax H3) stay dense. FastH3 Omni
+  INT8, 1344x768, RTX 5090: sampling 1.37x faster than dense at 5 s and 1.87x at
+  10 s, bit-identical to ComfyUI's own Model Sparse Attention node in VSA mode.
 - **Quality controls:** the default first 20% of steps, first two blocks and last
   step stay dense. SOL uses tau 1.0, 256 extra tokens, and native exact KV/query
   sinks for conditioning. Sparse attention is approximate, not lossless.

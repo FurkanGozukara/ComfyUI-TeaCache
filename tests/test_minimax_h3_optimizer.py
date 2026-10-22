@@ -102,6 +102,35 @@ class OptimizerTests(unittest.TestCase):
             self.assertEqual(sparse.call_count, 1)
         self.assertIn("unsupported", opt.sparse_failed_reason)
 
+    def test_vsa_runs_the_trained_pattern_in_every_step_and_block(self):
+        with mock.patch.object(self.module.native_sparse, "SparseAttnPatch") as patch_class:
+            opt = self.make_optimizer(sparse_mode="vsa", sparse_dense_last_steps=1, sparse_extra_tokens=256)
+        kwargs = patch_class.call_args.kwargs
+        self.assertEqual((kwargs["vsa"], kwargs["topk_ratio"], kwargs["extra_tokens"], kwargs["dense_blocks"]),
+                         (True, 0.10, 0, set()))
+        for step in range(8):
+            opt.step_index = step
+            self.assertTrue(all(opt.sparse_window_open(index) for index in (0, 1, 49)))
+
+    def test_vsa_skips_the_speed_benchmark(self):
+        opt = self.make_optimizer(sparse_mode="vsa")
+        attn = mock.Mock(return_value="dense", heads=4, head_dim=128)
+        with mock.patch.object(opt, "_gate_native") as gate, \
+                mock.patch.object(self.module.native_sparse, "h3_sparse_attention", return_value="sparse"):
+            self.assertEqual(opt.native_attention(attn, torch.zeros(257, 512), None, {}, 0), "sparse")
+        gate.assert_not_called()
+
+    def test_vsa_without_learned_coarse_branch_stays_dense(self):
+        block = types.SimpleNamespace(attn=types.SimpleNamespace(to_gate_compress=None))
+        model = mock.Mock()
+        model.get_model_object.return_value = type("MiniMaxH3Model", (), {"blocks": [block]})()
+        with self.assertLogs(level="WARNING") as logs:
+            result = self.module.MiniMaxH3SpeedOptimizer().apply(
+                model, False, 0.08, 0.15, 0.95, 3, "vsa", 0.2, 2, enable_speedup=True)
+        self.assertEqual(result, (model, True))
+        model.clone.assert_not_called()
+        self.assertIn("vsa needs a VSA-trained FastH3 model", logs.output[0])
+
     def test_existing_block_patch_composes_with_cache(self):
         opt = self.make_optimizer(fbc_enabled=True, sparse_mode="disabled")
         previous = mock.Mock(side_effect=lambda args, extra: {"img": args["img"] + 7})

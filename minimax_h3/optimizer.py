@@ -28,6 +28,9 @@ try:
 except ImportError:  # ComfyUI versions before the allocation compiler.
     from contextlib import nullcontext as pause_malloc_graph
 
+# FastH3's VSA checkpoints (FastH3 Omni included) are trained to keep 10% of the video cubes.
+VSA_KEEP_RATIO = 0.10
+
 class _CondCache:
     """FirstBlockCache state for one cond/uncond stream."""
 
@@ -86,11 +89,13 @@ class H3Optimizer:
         self._gate_done = {}
         self.native_patch = None
         if sparse_mode != "disabled" and native_sparse is not None:
+            # VSA reproduces the trained pattern, so it runs in every block without extra tokens.
+            vsa = sparse_mode == "vsa"
             self.native_patch = native_sparse.SparseAttnPatch(
-                tau=self.sparse_tau, topk_ratio=0.0, vsa=False,
+                tau=self.sparse_tau, topk_ratio=VSA_KEEP_RATIO if vsa else 0.0, vsa=vsa,
                 sigma_start=float("inf"), sigma_end=0.0, min_tokens=self.sparse_min_video_rows,
-                dense_blocks=set(range(self.sparse_dense_layers)), sink_conditioning="exact_kv_and_rows",
-                extra_tokens=self.sparse_extra_tokens, verbose=verbose)
+                dense_blocks=set() if vsa else set(range(self.sparse_dense_layers)), sink_conditioning="exact_kv_and_rows",
+                extra_tokens=0 if vsa else self.sparse_extra_tokens, verbose=verbose)
 
     # ------------------------------------------------------------------ run observation
 
@@ -233,6 +238,8 @@ class H3Optimizer:
     def sparse_window_open(self, index):
         if self.sparse_mode == "disabled" or self.native_patch is None:
             return False
+        if self.sparse_mode == "vsa":
+            return True
         return (index >= self.sparse_dense_layers
                 and self.step_index >= math.ceil(self.sparse_dense_steps_pct * max(self.total_steps, 1))
                 and self.step_index < self.total_steps - self.sparse_dense_last_steps)
@@ -287,7 +294,7 @@ class H3Optimizer:
         sparse = lambda: native_sparse.h3_sparse_attention(attn, h, rope_freqs, transformer_options, self.native_patch, index)
         try:
             if key not in self._gate_done:
-                if self.sparse_mode == "enabled":
+                if self.sparse_mode in ("enabled", "vsa"):
                     self._gate_done[key] = True
                 else:
                     with pause_malloc_graph():
@@ -317,7 +324,7 @@ class MiniMaxH3SpeedOptimizer:
                 "fbc_start_percent": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Never skip before this fraction of the schedule (early steps set global structure)."}),
                 "fbc_end_percent": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Never skip after this fraction of the schedule (final steps set fine detail)."}),
                 "fbc_max_consecutive": ("INT", {"default": 3, "min": 1, "max": 50, "tooltip": "Cap on consecutive skipped steps."}),
-                "sparse_attention": (["auto", "enabled", "disabled"], {"default": "auto", "tooltip": "ComfyUI's native SOL attention, including its chunked H3 producer. Auto times complete projected attention and requires a 5% speed win; enabled skips that benchmark; disabled preserves dense attention. Sparse output is approximate."}),
+                "sparse_attention": (["auto", "enabled", "disabled", "vsa"], {"default": "auto", "tooltip": "ComfyUI's native SOL attention, including its chunked H3 producer. Auto times complete projected attention and requires a 5% speed win; enabled skips that benchmark; disabled preserves dense attention. Sparse output is approximate. vsa: the Video Sparse Attention FastH3 models such as FastH3 Omni were trained with (10% of the video cubes plus their learned coarse branch) in every step and block; the dense step/layer controls and extra tokens do not apply, and models without the learned branch stay dense."}),
                 "sparse_dense_steps_pct": ("FLOAT", {"default": 0.20, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Fraction of early steps that always run dense attention (reference: 10 of 50)."}),
                 "sparse_dense_layers": ("INT", {"default": 2, "min": 0, "max": 50, "tooltip": "First N transformer blocks always run dense attention (reference: 2)."}),
             },
@@ -343,8 +350,8 @@ class MiniMaxH3SpeedOptimizer:
     FUNCTION = "apply"
     CATEGORY = "TeaCache/MiniMaxH3"
     TITLE = "MiniMax H3 Speed Optimizer"
-    DESCRIPTION = ("Optional FirstBlockCache and ComfyUI's native SOL sparse attention. "
-                   "Auto benchmarks the complete native attention path against the model's dense backend. "
+    DESCRIPTION = ("Optional FirstBlockCache and ComfyUI's native sparse attention: SOL, or the VSA FastH3 models were trained with. "
+                   "Auto benchmarks the complete native SOL attention path against the model's dense backend. "
                    "The master switch can also drive the paired VAE speedup node. "
                    "Techniques that don't work or don't win on your GPU fall back to the normal path automatically.")
 
@@ -390,6 +397,10 @@ class MiniMaxH3SpeedOptimizer:
         if type(diffusion_model).__name__ != "MiniMaxH3Model":
             raise ValueError(f"MiniMaxH3SpeedOptimizer requires a MiniMax H3 model, got {type(diffusion_model).__name__}. "
                              "Connect the MiniMax H3 diffusion model (e.g. minimax_h3_fl2va / ref2va).")
+        if sparse_attention == "vsa" and diffusion_model.blocks[0].attn.to_gate_compress is None:
+            logging.warning("[MiniMaxH3Speed] vsa needs a VSA-trained FastH3 model; this model has no learned "
+                            "coarse branch, so attention stays dense.")
+            sparse_attention = "disabled"
         if not first_block_cache and sparse_attention == "disabled":
             return (model, True)
         if sparse_attention != "disabled" and native_sparse is None:
