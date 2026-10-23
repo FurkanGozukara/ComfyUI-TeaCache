@@ -28,7 +28,7 @@ import folder_paths
 
 DEFAULT_FACE_REFINEMENT_PROMPT = (
     "Preserve the exact same identity, expression, head pose, and facial proportions. "
-    "Resolve natural coherent eyes, skin texture, beard strands, and hair detail. "
+    "Resolve natural coherent eyes, skin texture, and hair detail. "
     "No identity change, beautification, or facial reshaping."
 )
 
