@@ -46,6 +46,12 @@ See [SOL update validation](docs/sol_attention_update.md) for dated measurements
   The node patches a shallow VAE copy, leaving the loader's cached VAE untouched, so disabling
   the shared master switch after an accelerated run still uses the original decoder.
 
+- **`pika_h3_flex` scheduler:** loading this pack adds the Pika H3 Flex 6-step schedule to
+  ComfyUI's scheduler list (`1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0`, the same
+  list Comfy-Org's Pika H3 Flex templates give `ManualSigmas`). Use it with the Pika H3 Flex
+  LoRAs, the `lcm` sampler, 6 steps and CFG 1; frontends with only a scheduler dropdown (the
+  SwarmUI sampler) can then run Pika H3 Flex. Other step counts log a warning and keep 6 steps.
+
 Notes: the AdaLN-precompute stage of the reference line is already baked into ComfyUI's H3
 checkpoints (`adaln_t_table` curve basis), and ComfyUI core already fuses QKV projection,
 RMSNorm+partial-RoPE and SwiGLU via comfy-kitchen, so those stages are not duplicated here.
