@@ -1,12 +1,13 @@
-"""MiniMax H3 speed, low-VRAM, live-preview and face-inpaint nodes (NVlabs Sana sol-engine port) with vendored sol_attn."""
+"""MiniMax H3 speed, low-VRAM, live-preview, face-inpaint and video-edit nodes (NVlabs Sana sol-engine port) with vendored sol_attn."""
 
 from .optimizer import NODE_CLASS_MAPPINGS as SPEED_CLASS, NODE_DISPLAY_NAME_MAPPINGS as SPEED_DISPLAY
 from .low_vram import NODE_CLASS_MAPPINGS as LOW_VRAM_CLASS, NODE_DISPLAY_NAME_MAPPINGS as LOW_VRAM_DISPLAY
 from .live_preview import NODE_CLASS_MAPPINGS as PREVIEW_CLASS, NODE_DISPLAY_NAME_MAPPINGS as PREVIEW_DISPLAY
 from .face_refine import NODE_CLASS_MAPPINGS as FACE_CLASS, NODE_DISPLAY_NAME_MAPPINGS as FACE_DISPLAY
+from .video_edit import NODE_CLASS_MAPPINGS as VIDEO_EDIT_CLASS, NODE_DISPLAY_NAME_MAPPINGS as VIDEO_EDIT_DISPLAY
 from . import pika_schedule  # noqa: F401  registers the "pika_h3_flex" scheduler
 
-NODE_CLASS_MAPPINGS = {**SPEED_CLASS, **LOW_VRAM_CLASS, **PREVIEW_CLASS, **FACE_CLASS}
-NODE_DISPLAY_NAME_MAPPINGS = {**SPEED_DISPLAY, **LOW_VRAM_DISPLAY, **PREVIEW_DISPLAY, **FACE_DISPLAY}
+NODE_CLASS_MAPPINGS = {**SPEED_CLASS, **LOW_VRAM_CLASS, **PREVIEW_CLASS, **FACE_CLASS, **VIDEO_EDIT_CLASS}
+NODE_DISPLAY_NAME_MAPPINGS = {**SPEED_DISPLAY, **LOW_VRAM_DISPLAY, **PREVIEW_DISPLAY, **FACE_DISPLAY, **VIDEO_EDIT_DISPLAY}
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
