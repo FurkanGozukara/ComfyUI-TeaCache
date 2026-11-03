@@ -78,6 +78,8 @@ class MiniMaxH3MaskedVideoEdit:
                 "mask": ("MASK", {"tooltip": "White = regenerate, black = keep the source. One frame applies to the whole clip. Not connected: the latent passes through unchanged."}),
                 "edge_feather": ("INT", {"default": 8, "min": 0, "max": 128, "step": 1,
                     "tooltip": "Soften the edge of the composite mask by this many pixels."}),
+                "pixel_composite": ("BOOLEAN", {"default": False,
+                    "tooltip": "Composite through the exact mask instead of the regenerated latent cells: the kept subject keeps a precise edge (background replace)."}),
             },
         }
 
@@ -89,7 +91,7 @@ class MiniMaxH3MaskedVideoEdit:
     DESCRIPTION = ("Turn an H3 generation into a masked edit of a real clip: only the masked region is regenerated. "
                    "Feed composite_mask and canvas_frames to MiniMax H3 Masked Edit Composite after decoding.")
 
-    def run(self, av_latent, vae, grow_pixels, hold_frames, images=None, mask=None, edge_feather=8):
+    def run(self, av_latent, vae, grow_pixels, hold_frames, images=None, mask=None, edge_feather=8, pixel_composite=False):
         if images is None or mask is None:
             return (av_latent, None, None, "images or mask not connected: latent passed through unchanged")
         samples = av_latent["samples"]
@@ -121,8 +123,14 @@ class MiniMaxH3MaskedVideoEdit:
         out["samples"] = comfy.nested_tensor.NestedTensor(members)
         out["noise_mask"] = comfy.nested_tensor.NestedTensor((cells.movedim(0, 1).unsqueeze(0).to(video.device), audio_mask))
 
-        owner = [j for j, (a, b) in enumerate(zip(starts, starts[1:])) for _ in range(a, b)]
-        composite = F.interpolate(cells[owner], size=(height, width), mode="nearest")
+        if pixel_composite:
+            # A hair wider than the mask, so no fringe of the old background survives around the kept subject.
+            composite = _fit_frames(mask.reshape(-1, *mask.shape[-2:]), frames).unsqueeze(1).float()
+            composite = F.interpolate(composite, size=(height, width), mode="bilinear")
+            composite = F.max_pool2d(composite, 5, stride=1, padding=2)
+        else:
+            owner = [j for j, (a, b) in enumerate(zip(starts, starts[1:])) for _ in range(a, b)]
+            composite = F.interpolate(cells[owner], size=(height, width), mode="nearest")
         if edge_feather > 0:
             composite = F.avg_pool2d(composite, 2 * edge_feather + 1, stride=1, padding=edge_feather, count_include_pad=False)
 
