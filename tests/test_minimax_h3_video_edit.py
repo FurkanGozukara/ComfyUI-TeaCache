@@ -192,6 +192,31 @@ class MaskedVideoEditTests(unittest.TestCase):
         self.assertEqual(tuple(composite.shape), (22, 64, 96))
 
 
+    def test_a_clip_of_another_shape_is_centre_cropped_not_stretched(self):
+        images = torch.full((22, 32, 64, 3), 0.5)  # 2:1 clip onto a square 64x64 canvas
+        images[:, :, :16] = 0.0
+        images[:, :, 48:] = 1.0
+        mask = torch.zeros(22, 32, 64)
+        mask[10, 4, 4] = 1.0     # left quarter: outside the square crop
+        mask[10, 16, 32] = 1.0   # centre
+        out, composite, canvas, report = self.run_node(av_latent(lat_h=4, lat_w=4), images, mask, pixel_composite=True)
+        self.assertEqual(tuple(canvas.shape), (22, 64, 64, 3))
+        self.assertTrue(torch.allclose(canvas, torch.full_like(canvas, 0.5), atol=1e-4))  # only the 0.5 middle
+        vmask = out["noise_mask"].unbind()[0]
+        self.assertEqual(vmask.nonzero().tolist(), [[0, 0, 3, 2, 2]])  # the centre dot, nothing from the left edge
+        self.assertEqual(float(composite[10, :, :8].sum()), 0.0)
+        self.assertIn("centre-cropped to 32x32", report)
+
+    def test_canvas_grid_differences_keep_the_previous_resize(self):
+        images = torch.rand(22, 64, 97, 3)  # 1 % wider than the 96x64 canvas
+        mask = torch.zeros(22, 64, 97)
+        out, composite, canvas, report = self.run_node(av_latent(), images, mask)
+        expected = comfy.utils.common_upscale(images.movedim(-1, 1), 96, 64, "area", "disabled").clamp(0.0, 1.0).movedim(1, -1)
+        self.assertTrue(torch.equal(canvas, expected))
+        self.assertNotIn("cropped", report)
+        self.assertTrue(torch.equal(video_edit.crop_to_aspect(mask, 96, 64), mask))
+
+
 class MaskedEditCompositeTests(unittest.TestCase):
     def test_pass_through(self):
         images = torch.rand(3, 8, 8, 3)

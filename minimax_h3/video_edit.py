@@ -32,6 +32,22 @@ def _fit_frames(x, n):
     return torch.cat([x, x[-1:].expand(n - x.shape[0], *x.shape[1:])])
 
 
+def crop_to_aspect(x, width, height, tolerance=0.02):
+    """Centre-crop the last two dims [..., H, W] to the aspect ratio of width x height, so a held clip is never
+    stretched onto a canvas of another shape. Differences up to ``tolerance`` (the 32 px canvas grid) are left to
+    the resize, as before."""
+    h, w = x.shape[-2:]
+    if abs((w / h) / (width / height) - 1.0) <= tolerance:
+        return x
+    if w / h > width / height:
+        crop_w = max(1, round(h * width / height))
+        left = (w - crop_w) // 2
+        return x[..., left:left + crop_w]
+    crop_h = max(1, round(w * height / width))
+    top = (h - crop_h) // 2
+    return x[..., top:top + crop_h, :]
+
+
 def edit_cell_mask(mask, latent_t, lat_h, lat_w, ratio, grow, hold):
     """[F,H,W] edit mask (white = regenerate) -> [T,1,h,w] latent cell mask, 1 where any covered pixel is edited."""
     starts = latent_frame_starts(latent_t)
@@ -106,10 +122,18 @@ class MiniMaxH3MaskedVideoEdit:
         frames = starts[-1]
 
         note = ""
+        source_h, source_w = images.shape[1:3]
+        images = crop_to_aspect(images.movedim(-1, 1), width, height).movedim(1, -1)
+        mask = crop_to_aspect(mask, width, height)
+        if images.shape[1:3] != (source_h, source_w):
+            note = (f"the {source_w}x{source_h} clip was centre-cropped to {images.shape[2]}x{images.shape[1]} to match "
+                    f"the {width}x{height} output's aspect ratio instead of being stretched\n")
+            logging.info("[MiniMaxH3VideoEdit] %s", note.strip())
         if images.shape[0] != frames:
-            note = (f"WARNING: {images.shape[0]} source frames but the latent holds {frames} (H3 uses 17k+5 frames); "
-                    f"the source was {'trimmed' if images.shape[0] > frames else 'padded with its last frame'}.\n")
-            logging.warning("[MiniMaxH3VideoEdit] %s", note.strip())
+            warning = (f"WARNING: {images.shape[0]} source frames but the latent holds {frames} (H3 uses 17k+5 frames); "
+                       f"the source was {'trimmed' if images.shape[0] > frames else 'padded with its last frame'}.\n")
+            logging.warning("[MiniMaxH3VideoEdit] %s", warning.strip())
+            note += warning
         canvas = _fit_frames(images[..., :3], frames).movedim(-1, 1)
         method = "area" if canvas.shape[-2] * canvas.shape[-1] > width * height else "bicubic"
         canvas = comfy.utils.common_upscale(canvas, width, height, method, "disabled").clamp(0.0, 1.0).movedim(1, -1)
